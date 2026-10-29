@@ -14,7 +14,10 @@ import { decodeTableMarkdown } from "./decodeTableRecord.js";
 import { uniqueFileName } from "./filename.js";
 import {
   decodeAttachmentFilename,
+  decodePaperFilename,
   formatAttachmentMarkdown,
+  formatPaperFallbackMarkdown,
+  isPaperUti,
   isTableUti,
   parseAssetField,
   renderPlaceholders,
@@ -137,6 +140,57 @@ export function matchAttachmentRecords(
   return matched;
 }
 
+/**
+ * Matches a `com.apple.paper` reference straight to its own `Attachment`
+ * record's `FallbackImage` asset - there's no `Media` record to chain
+ * through the way there is for a photo or audio file (verified live,
+ * 2026-09-16). Mirrors `matchAttachmentRecords`' shape (and its
+ * checksum-based re-download skip) so both flow through the same download
+ * and markdown-rendering code in `resolveNoteAttachments`; `undefined` when
+ * the record is missing or lacks a well-formed `FallbackImage`, in which
+ * case the caller degrades to an unknown-content marker for just this one
+ * embed, per the Safety Guarantee Audit.
+ */
+export function matchPaperAttachment(
+  ref: AttachmentReference,
+  attachmentRecord: CloudKitRecord | undefined,
+  noteRecordName: string,
+  existingAttachments: Record<string, CloneStateAttachmentEntry>,
+  usedAttachmentFileNames: Set<string>,
+  noteDir: string,
+): MatchedAttachment | undefined {
+  if (!attachmentRecord || attachmentRecord.recordType !== "Attachment") {
+    return undefined;
+  }
+  const asset = parseAssetField(attachmentRecord.fields.FallbackImage);
+  if (!asset) {
+    return undefined;
+  }
+
+  const existing = existingAttachments[ref.attachmentIdentifier];
+  const fileName = existing
+    ? path.basename(existing.file)
+    : uniqueFileName(
+        decodePaperFilename(attachmentRecord.fields.TitleEncrypted, ref.attachmentIdentifier),
+        usedAttachmentFileNames,
+      );
+  usedAttachmentFileNames.add(fileName);
+  const relativeFile = existing ? existing.file : path.posix.join(noteDir, ATTACHMENTS_DIR, fileName);
+
+  return {
+    recordName: ref.attachmentIdentifier,
+    relativeFile,
+    linkPath: path.posix.relative(noteDir, relativeFile),
+    needsDownload: !existing || existing.mediaFileChecksum !== asset.fileChecksum,
+    downloadURL: asset.downloadURL,
+    // No separate Media record exists for a Paper attachment, so the entry
+    // points back at the Attachment record itself - still enough identity
+    // for change-detection (mediaFileChecksum) and for push's
+    // trackedFileAttachmentIds lookup (keyed by Attachment recordName).
+    entry: { file: relativeFile, mediaRecordName: ref.attachmentIdentifier, mediaFileChecksum: asset.fileChecksum, noteRecordName },
+  };
+}
+
 /** A resolved table's raw `MergeableDataEncrypted` bytes plus enough
  * identity to snapshot it into version history - deliberately separate from
  * `CloneStateTableAttachmentEntry` (which is state-tracking only, no raw
@@ -245,6 +299,7 @@ export async function resolveNoteAttachments(
   const fileRefIndexes: number[] = [];
   const tableAttachments: Record<string, CloneStateTableAttachmentEntry> = {};
   const tableAttachmentSnapshots: TableAttachmentSnapshotSource[] = [];
+  const attachments: Record<string, CloneStateAttachmentEntry> = {};
 
   for (let i = 0; i < slots.length; i += 1) {
     const slot = slots[i];
@@ -274,13 +329,26 @@ export async function resolveNoteAttachments(
           });
         }
       }
+    } else if (isPaperUti(ref.typeUti)) {
+      const attachmentRecord = attachmentByName.get(ref.attachmentIdentifier);
+      const matched = matchPaperAttachment(ref, attachmentRecord, noteRecordName, existingAttachments, usedAttachmentFileNames, noteDir);
+      if (!matched) {
+        replacements[i] = formatEmbedMarker(ref);
+      } else {
+        if (matched.needsDownload) {
+          const bytes = await fetchAssetBytes(matched.downloadURL);
+          await mkdir(path.dirname(path.join(targetDir, matched.relativeFile)), { recursive: true });
+          await writeFile(path.join(targetDir, matched.relativeFile), bytes);
+        }
+        attachments[matched.recordName] = matched.entry;
+        replacements[i] = formatPaperFallbackMarkdown(matched.linkPath);
+      }
     } else {
       fileRefIndexes.push(i);
       fileRefs.push(ref);
     }
   }
 
-  const attachments: Record<string, CloneStateAttachmentEntry> = {};
   if (fileRefs.length > 0) {
     const mediaRecordNames = extractMediaRecordNames(fileRefs, attachmentRecords);
     const knownMediaRecordNames = mediaRecordNames.filter((name): name is string => name !== undefined);

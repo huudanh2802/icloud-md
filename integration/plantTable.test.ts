@@ -146,7 +146,7 @@ test("rendering the table in and planning a push back reconstructs the same body
   const localText = renderPlaceholders(classified.markdownText, [tableMarkdown]);
   assert.ok(localText.includes("| R0C0 | R0C1 |"), `the table should render into the file: ${JSON.stringify(localText)}`);
 
-  const plan = planEmbedRepresentations(localText, classified.embedSlots, new Set());
+  const plan = planEmbedRepresentations(localText, classified.embedSlots, new Map(), "");
   assert.equal(plan.ok, true, plan.ok ? "" : plan.reason);
   assert.ok(plan.ok);
   assert.equal(plan.reconstructedBodyText, classified.markdownText, "an untouched table must plan back to an identical body");
@@ -165,7 +165,7 @@ test("a local table edit plans back as a changed grid and an unchanged body", ()
   const tableMarkdown = decodeTableMarkdown(Buffer.from(TABLE_REV_BASELINE, "base64"));
   const edited = renderPlaceholders(classified.markdownText, [tableMarkdown.replace("R2C1", "R2C1-edited")]);
 
-  const plan = planEmbedRepresentations(edited, classified.embedSlots, new Set());
+  const plan = planEmbedRepresentations(edited, classified.embedSlots, new Map(), "");
   assert.ok(plan.ok);
   assert.equal(plan.reconstructedBodyText, classified.markdownText, "a cell edit must not disturb the note's own text");
   assert.equal(plan.tables[0]?.block.grid[1]?.[1], "R2C1-edited");

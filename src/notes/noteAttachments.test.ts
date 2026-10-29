@@ -8,9 +8,12 @@ import {
   decodeAttachmentFilename,
   decodeNoteAttachmentRefs,
   decodeNoteEmbedSlots,
+  decodePaperFilename,
   formatAttachmentMarkdown,
+  formatPaperFallbackMarkdown,
   hasAttachmentReference,
   isImageUti,
+  isPaperUti,
   isTableUti,
   parseAssetField,
   renderAttachmentPlaceholders,
@@ -174,9 +177,28 @@ test("isTableUti recognizes the table UTI and rejects file UTIs", () => {
   assert.equal(isTableUti("com.apple.m4a-audio"), false);
 });
 
+test("isPaperUti recognizes the Pencil/paper UTI and rejects everything else", () => {
+  assert.equal(isPaperUti("com.apple.paper"), true);
+  assert.equal(isPaperUti("com.apple.drawing.2"), false);
+  assert.equal(isPaperUti("public.jpeg"), false);
+});
+
 test("formatAttachmentMarkdown matches what renderAttachmentPlaceholders produces per-ref", () => {
   const ref: AttachmentReference = { attachmentIdentifier: "A", typeUti: "public.jpeg" };
   assert.equal(formatAttachmentMarkdown(ref, "attachments/photo.jpeg"), "![photo.jpeg](attachments/photo.jpeg)");
+});
+
+test("formatPaperFallbackMarkdown always embeds as an image, unlike formatAttachmentMarkdown for a non-image UTI", () => {
+  assert.equal(formatPaperFallbackMarkdown("attachments/ITS New regs.png"), "![ITS New regs.png](attachments/ITS%20New%20regs.png)");
+});
+
+test("decodePaperFilename decodes a base64 TitleEncrypted field and appends .png", () => {
+  const field = { value: Buffer.from("ITS New regs").toString("base64"), type: "ENCRYPTED_BYTES" as const };
+  assert.equal(decodePaperFilename(field, "REC1"), "ITS New regs.png");
+});
+
+test("decodePaperFilename falls back to the recordName when TitleEncrypted is absent", () => {
+  assert.equal(decodePaperFilename(undefined, "REC1"), "REC1.png");
 });
 
 test("renderPlaceholders substitutes a mix of table markdown and file links by position", () => {

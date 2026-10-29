@@ -11,8 +11,15 @@
  * The network/fs orchestration lives in `src/commands/push.ts`.
  */
 
+import path from "node:path";
 import { findMarkdownTableBlocks, type MarkdownTableBlock } from "./markdownTable.js";
-import { isTableUti, OBJECT_REPLACEMENT_CHARACTER, type AttachmentReference, type EmbedSlot } from "./noteAttachments.js";
+import {
+  formatAttachmentMarkdown,
+  isTableUti,
+  OBJECT_REPLACEMENT_CHARACTER,
+  type AttachmentReference,
+  type EmbedSlot,
+} from "./noteAttachments.js";
 import { formatEmbedMarker, parseEmbedMarkers } from "./unknownContent.js";
 
 /** One table slot matched to its local markdown block, in document order -
@@ -30,6 +37,11 @@ export type EmbedRepresentationPlan =
       reconstructedBodyText: string;
       /** Table slots in document order (may be empty). */
       tables: MatchedTableBlock[];
+      /** Tracked file attachments whose reference was missing/edited and
+       * got dropped rather than refused - only ever non-empty when the
+       * caller passed `allowAttachmentRemoval`. The caller should drop
+       * these from `state.attachments` once the push actually lands. */
+      removedAttachmentIds: string[];
     }
   | { ok: false; reason: string };
 
@@ -46,15 +58,30 @@ interface LocalRepresentation {
  * (pull always wrote a marker) or when its attachment id appears among the
  * local markers (pull couldn't render it - an undecodable table, an
  * unresolvable file chain, an unsupported kind). An identified table slot
- * without a marker expects a markdown table block; an id found in
- * `trackedFileAttachmentIds` (attachment records that resolved to downloaded
- * files at pull time, from `state.attachments`) keeps the existing
- * file-attachment refusal - there's no file write path yet.
+ * without a marker expects a markdown table block; a resolved (non-table)
+ * file attachment - present in `trackedFileAttachments`, keyed by
+ * attachmentIdentifier to its vault-root-relative file path from
+ * `state.attachments` - expects its exact `formatAttachmentMarkdown`
+ * rendering to still be present verbatim: editing an existing attachment's
+ * *file* still has no write path and refuses, but merely leaving it alone
+ * (the common case - typing elsewhere, or pasting a new image) is not an
+ * edit to it and is spliced back to a placeholder like any other slot.
+ *
+ * `allowAttachmentRemoval` is an explicit, caller-opted-in escape hatch
+ * (default behavior is unchanged: refuse): when a tracked file attachment's
+ * reference can't be found, treat it as the user having deleted it from the
+ * note - drop the slot instead of refusing, so it simply doesn't reappear in
+ * `reconstructedBodyText` and the ordinary text diff downstream removes its
+ * U+FFFC like any other deleted character. This can't tell an intentional
+ * deletion from something else having eaten the reference, which is exactly
+ * why it stays opt-in rather than the default.
  */
 export function planEmbedRepresentations(
   localText: string,
   slots: readonly EmbedSlot[],
-  trackedFileAttachmentIds: ReadonlySet<string>,
+  trackedFileAttachments: ReadonlyMap<string, string>,
+  noteDir: string,
+  allowAttachmentRemoval = false,
 ): EmbedRepresentationPlan {
   const markers = parseEmbedMarkers(localText);
   const markerIds = new Set(
@@ -64,8 +91,10 @@ export function planEmbedRepresentations(
   const lineStartOffsets = computeLineStartOffsets(localText);
 
   const representations: LocalRepresentation[] = [];
+  const removedAttachmentIds: string[] = [];
   let markerCursor = 0;
   let tableCursor = 0;
+  let fileSearchCursor = 0;
 
   for (const slot of slots) {
     const markerContent =
@@ -90,11 +119,27 @@ export function planEmbedRepresentations(
         });
         continue;
       }
-      if (trackedFileAttachmentIds.has(slot.ref.attachmentIdentifier)) {
-        return {
-          ok: false,
-          reason: "this note has a file attachment - it can't be edited through this tool and stays read-only",
-        };
+      const trackedFile = trackedFileAttachments.get(slot.ref.attachmentIdentifier);
+      if (trackedFile !== undefined) {
+        const linkPath = path.posix.relative(noteDir, trackedFile);
+        const expectedMarkdown = formatAttachmentMarkdown(slot.ref, linkPath);
+        const index = localText.indexOf(expectedMarkdown, fileSearchCursor);
+        if (index === -1) {
+          if (allowAttachmentRemoval) {
+            removedAttachmentIds.push(slot.ref.attachmentIdentifier);
+            continue;
+          }
+          return {
+            ok: false,
+            reason:
+              `the attachment reference for "${path.posix.basename(linkPath)}" is missing or was edited - ` +
+              "an existing attachment's file can't be edited through this tool; leave its reference exactly as " +
+              'pull wrote it, or run "restore" to discard the edit',
+          };
+        }
+        fileSearchCursor = index + expectedMarkdown.length;
+        representations.push({ start: index, end: index + expectedMarkdown.length });
+        continue;
       }
       return {
         ok: false,
@@ -168,6 +213,7 @@ export function planEmbedRepresentations(
     ok: true,
     reconstructedBodyText: reconstructed,
     tables: representations.flatMap((representation) => (representation.table ? [representation.table] : [])),
+    removedAttachmentIds,
   };
 }
 

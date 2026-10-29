@@ -338,10 +338,18 @@ program
       'places. Run "status" first to see exactly what push will do, including anything it would refuse.',
   )
   .option("--dry-run", "report what would be pushed without changing anything")
-  .action(async (directory: string | undefined, opts: { dryRun?: boolean }, command: Command) => {
+  .option(
+    "--allow-attachment-removal",
+    "treat a tracked attachment whose reference can't be found locally as removed rather than refusing the whole note",
+  )
+  .action(async (directory: string | undefined, opts: { dryRun?: boolean; allowAttachmentRemoval?: boolean }, command: Command) => {
     const context = contextFor(command);
     const targetDir = await resolveTargetDir(directory);
-    const result = await runPush(targetDir, { dryRun: opts.dryRun === true, onLoginStatus: makeStatusSink(context) });
+    const result = await runPush(targetDir, {
+      dryRun: opts.dryRun === true,
+      allowAttachmentRemoval: opts.allowAttachmentRemoval === true,
+      onLoginStatus: makeStatusSink(context),
+    });
     emitResult(context, result, (r) => {
       printNotices(r.notices);
       for (const entry of r.entries) {

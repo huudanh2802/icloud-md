@@ -8,6 +8,7 @@ import {
   decodeTableAttachment,
   extractMediaRecordNames,
   matchAttachmentRecords,
+  matchPaperAttachment,
   removeAttachmentsForNote,
   removeTableAttachmentsForNote,
 } from "./attachmentSync.js";
@@ -93,6 +94,37 @@ const TABLE_ATTACHMENT_RECORD: CloudKitRecord = {
       value:
         "eJzt1E9oFFccwPGZyWZ39iWNr5OahofQdgxJjHZdB5tDxUOTqKTEoJtNemghxHW0u2x2ZXdFI3opiBcPihRLyUULObVNm4stNFQwSslhD+k/Dy0UNNAiEimoB7H27SbVbLKhh1JP32GH3/x+7/d5895jd23D+fq2ZRvSUF/etoQtgvrZbDZUX+ptO6BabcNx3Vej/3KpoG06VtTUsUbHGh1rdbR1DOr4gqoXQgRKM+vMUq+nNtumarMtZ6P7WncsPnIg7Xdn00dHMz3JnJ8oJLOZPv9QIZ6NJQ+/X1A/mx+Y35tiwhQnRJ8TXPj2G/1RsjxhaeHl2G6WK6auWKoc2y3VJGw99kRf63Tf0+cOyzZLt/OS3p7cOhuev3dhr3F5z0yxMXq+S1dNR16fbL6/M198PD98LRG5dHXKaReOsKKlbQXU02Mq10K6FnxWW9ZZW6Uz9Kym6lPCtvQhBRxLmhWZVZHVVGSB//tE7vRfnPbnHtxtGZ+9NTbUsLB4Ilc2dY7sOntj/5mBybbQw9S2pX0Kvafwin3W61rdqhMpdYoqnfVrnEhtRRasyEIVma06vMV31On5Gla8I6xrLy57xz+9pa/muhW9eraoXNa7O9bjWG9F/+PZWioS2+IYVWZZw1Ss0amyxsaVa+x67mt07eRBP1NIFsbcpkSu2o/YDeT99CE3mMjFssfybnhwsLenN3PQP+6GE7nF3rxbl/DT6aWk4+VEdjQycuRI2o90x3rikf6B/qOjB/xclYGBQi6ZOdyxftVA6S3L+zPZgp+PLP3NrB7o7V5jAIFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAVApPnmycaYlt/u6jYzt+/OlU17vvePLED198dfOT7WO/zQ21npuO/uHJ65PN93fmi4/nh68lIpeuTnnSP9V2OvDhGxOfnpt69PFfG+Ke3Dobnr93Ya9xec9MsTF6vsuTEyd794nxz4Y7fy/KP9XufZ68sqlzZNfZG/vPDEy2hR6mtnnyvdZXZFPdo19v/mLEPo8PbvTknf6L0/7cg7st47O3xoYaFt7cIJRYtUrHsi19m38DuMWS1w==",
       type: "ENCRYPTED_BYTES",
+    },
+  },
+};
+
+// Real `Attachment` record captured live for a handwritten/Apple-Pencil
+// note ("ITS New regs", 2026-09-16). No `Media` reference at all - unlike a
+// photo or audio file, the record carries its own `FallbackImage` (a plain
+// PNG rendering, confirmed by downloading and inspecting real bytes) and a
+// `PaperDatabase` asset (the actual editable ink data, in a proprietary
+// format this tool has no model for and doesn't attempt to decode).
+const PAPER_ATTACHMENT_RECORD: CloudKitRecord = {
+  recordName: "F81D2192-D007-4447-9EFE-42FF398C8E45",
+  recordType: "Attachment",
+  fields: {
+    UTI: { value: "com.apple.paper", type: "STRING" },
+    TitleEncrypted: { value: "SVRTIE5ldyByZWdz", type: "ENCRYPTED_BYTES" }, // "ITS New regs"
+    FallbackImage: {
+      value: {
+        fileChecksum: "AQDigtV9TL2W52QC9aE4LpUwV0xw",
+        size: 387391,
+        downloadURL: "https://cvws.icloud-content.com/B/paper-fallback-image",
+      },
+      type: "ASSETID",
+    },
+    PaperDatabase: {
+      value: {
+        fileChecksum: "AZawZ3v7KCUeVHdQHymspb25ILf7",
+        size: 237151,
+        downloadURL: "https://cvws.icloud-content.com/B/paper-database",
+      },
+      type: "ASSETID",
     },
   },
 };
@@ -381,4 +413,55 @@ test("decodeTableAttachment refuses malformed MergeableDataEncrypted rather than
     fields: { MergeableDataEncrypted: { value: Buffer.from("not a table").toString("base64"), type: "ENCRYPTED_BYTES" } },
   };
   assert.equal(decodeTableAttachment(broken), undefined);
+});
+
+test("matchPaperAttachment resolves a new Pencil/paper attachment's FallbackImage from a real record", () => {
+  const ref: AttachmentReference = { attachmentIdentifier: "F81D2192-D007-4447-9EFE-42FF398C8E45", typeUti: "com.apple.paper" };
+  const matched = matchPaperAttachment(ref, PAPER_ATTACHMENT_RECORD, "NOTE1", {}, new Set(), "");
+  assert.deepEqual(matched, {
+    recordName: "F81D2192-D007-4447-9EFE-42FF398C8E45",
+    relativeFile: "attachments/ITS New regs.png",
+    linkPath: "attachments/ITS New regs.png",
+    needsDownload: true,
+    downloadURL: "https://cvws.icloud-content.com/B/paper-fallback-image",
+    entry: {
+      file: "attachments/ITS New regs.png",
+      mediaRecordName: "F81D2192-D007-4447-9EFE-42FF398C8E45",
+      mediaFileChecksum: "AQDigtV9TL2W52QC9aE4LpUwV0xw",
+      noteRecordName: "NOTE1",
+    },
+  });
+});
+
+test("matchPaperAttachment falls back to the recordName when TitleEncrypted is absent", () => {
+  const ref: AttachmentReference = { attachmentIdentifier: "F81D2192-D007-4447-9EFE-42FF398C8E45", typeUti: "com.apple.paper" };
+  const { TitleEncrypted: _unused, ...fieldsWithoutTitle } = PAPER_ATTACHMENT_RECORD.fields;
+  const record: CloudKitRecord = { ...PAPER_ATTACHMENT_RECORD, fields: fieldsWithoutTitle };
+  const matched = matchPaperAttachment(ref, record, "NOTE1", {}, new Set(), "");
+  assert.equal(matched?.relativeFile, "attachments/F81D2192-D007-4447-9EFE-42FF398C8E45.png");
+});
+
+test("matchPaperAttachment skips re-download when the tracked checksum still matches", () => {
+  const ref: AttachmentReference = { attachmentIdentifier: "F81D2192-D007-4447-9EFE-42FF398C8E45", typeUti: "com.apple.paper" };
+  const existing = {
+    "F81D2192-D007-4447-9EFE-42FF398C8E45": {
+      file: "attachments/ITS New regs.png",
+      mediaRecordName: "F81D2192-D007-4447-9EFE-42FF398C8E45",
+      mediaFileChecksum: "AQDigtV9TL2W52QC9aE4LpUwV0xw",
+      noteRecordName: "NOTE1",
+    },
+  };
+  const matched = matchPaperAttachment(ref, PAPER_ATTACHMENT_RECORD, "NOTE1", existing, new Set(), "");
+  assert.equal(matched?.needsDownload, false);
+});
+
+test("matchPaperAttachment refuses when the record has no FallbackImage (e.g. a classic PencilKit drawing this tool hasn't verified)", () => {
+  const ref: AttachmentReference = { attachmentIdentifier: "R1", typeUti: "com.apple.paper" };
+  const record: CloudKitRecord = { recordName: "R1", recordType: "Attachment", fields: { UTI: { value: "com.apple.paper", type: "STRING" } } };
+  assert.equal(matchPaperAttachment(ref, record, "NOTE1", {}, new Set(), ""), undefined);
+});
+
+test("matchPaperAttachment refuses when the record is missing", () => {
+  const ref: AttachmentReference = { attachmentIdentifier: "R1", typeUti: "com.apple.paper" };
+  assert.equal(matchPaperAttachment(ref, undefined, "NOTE1", {}, new Set(), ""), undefined);
 });

@@ -127,6 +127,25 @@ export function isTableUti(typeUti: string): boolean {
   return typeUti === TABLE_UTI;
 }
 
+/**
+ * Apple's "Paper" canvas - the freeform/handwriting/Apple-Pencil surface
+ * Notes uses for drawings and scribbles. Unlike an image or audio file, its
+ * `Attachment` record carries no `Media` reference at all (verified live,
+ * 2026-09-16: a captured `com.apple.paper` record's only outgoing reference
+ * is its owning Note). The editable content lives in a proprietary
+ * `PaperDatabase` asset this tool has no model for, but the same record also
+ * carries a `FallbackImage` asset - a plain PNG rendering of the page Apple
+ * keeps precisely so non-native viewers can show *something* - which is what
+ * this tool renders instead. That makes a Paper-bearing note read-only here
+ * (see `matchPaperAttachment` / `embedPushEdit.ts`'s tracked-file-attachment
+ * refusal), the same as any note containing a photo.
+ */
+export const PAPER_UTI = "com.apple.paper";
+
+export function isPaperUti(typeUti: string): boolean {
+  return typeUti === PAPER_UTI;
+}
+
 /** Matches a markdown link/embed pointing at `attachments/...`, i.e. the
  * exact shape `renderAttachmentPlaceholders` produces. Used by `push` to
  * catch a hand-typed reference to a file that was never actually uploaded -
@@ -139,6 +158,53 @@ export function hasAttachmentReference(text: string): boolean {
   return ATTACHMENT_REFERENCE_PATTERN.test(text);
 }
 
+/** Same shape as `ATTACHMENT_REFERENCE_PATTERN`, capturing the encoded path
+ * so a caller can resolve it to a real file (see `findAttachmentReferences`). */
+const ATTACHMENT_REFERENCE_CAPTURE_PATTERN = /!?\[[^\]]*\]\(attachments\/([^)]+)\)/g;
+
+/** One `attachments/...` markdown reference found in a note's local text,
+ * with its path percent-decoded and resolved relative to the note's own
+ * directory - what `push` checks against the filesystem to tell a real
+ * pasted image (new attachment, needs uploading) from a bogus hand-typed
+ * reference (permanently refused; see `hasAttachmentReference`'s doc). */
+export interface LocalAttachmentReference {
+  /** The exact substring matched, e.g. "![pasted.png](attachments/pasted.png)". */
+  match: string;
+  /** "attachments/pasted.png", percent-decoded. */
+  relativeFile: string;
+}
+
+export function findAttachmentReferences(text: string): LocalAttachmentReference[] {
+  const refs: LocalAttachmentReference[] = [];
+  for (const m of text.matchAll(ATTACHMENT_REFERENCE_CAPTURE_PATTERN)) {
+    const encodedPath = m[1];
+    if (m[0] === undefined || encodedPath === undefined) {
+      continue;
+    }
+    refs.push({ match: m[0], relativeFile: `attachments/${decodeURIComponent(encodedPath)}` });
+  }
+  return refs;
+}
+
+/** The reverse of `UTI_EXTENSIONS`, restricted to image types - what a new
+ * local attachment needs uploading as. Deliberately conservative: an
+ * extension this doesn't recognize refuses the upload rather than guessing
+ * a UTI Apple's client might not render correctly. */
+const EXTENSION_UTIS: Record<string, string> = {
+  ".png": "public.png",
+  ".jpg": "public.jpeg",
+  ".jpeg": "public.jpeg",
+  ".heic": "public.heic",
+  ".tiff": "public.tiff",
+  ".gif": "public.gif",
+  ".webp": "public.webp",
+};
+
+export function utiForImageFilename(name: string): string | undefined {
+  const ext = path.extname(name).toLowerCase();
+  return EXTENSION_UTIS[ext];
+}
+
 /** The markdown embed (images) or link (everything else) for one resolved
  * file attachment, pointing at its downloaded file under `attachments/`. */
 export function formatAttachmentMarkdown(ref: AttachmentReference, relativeFile: string): string {
@@ -148,6 +214,18 @@ export function formatAttachmentMarkdown(ref: AttachmentReference, relativeFile:
     .map((segment) => encodeURIComponent(segment))
     .join("/");
   return isImageUti(ref.typeUti) ? `![${displayName}](${href})` : `[${displayName}](${href})`;
+}
+
+/** Always an image embed, regardless of the embed's own `typeUti` - used for
+ * a Paper attachment's `FallbackImage`, which is a real PNG rendering even
+ * though `com.apple.paper` itself isn't an image UTI (see `isPaperUti`). */
+export function formatPaperFallbackMarkdown(relativeFile: string): string {
+  const displayName = path.basename(relativeFile);
+  const href = relativeFile
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  return `![${displayName}](${href})`;
 }
 
 /**
@@ -213,6 +291,27 @@ export function decodeAttachmentFilename(field: CloudKitFieldValue | undefined, 
     }
   }
   return `${recordName}${extensionForUti(typeUti)}`;
+}
+
+/** Decodes a Paper `Attachment` record's `TitleEncrypted` field (the same
+ * base64-of-UTF-8 shape as a Media record's `FilenameEncrypted`, and the
+ * same field `object show` decodes generically as a record's `title`) for
+ * use as the downloaded fallback-image's file name, falling back to the
+ * recordName when absent. The `FallbackImage` asset has been verified live
+ * as a plain PNG (2026-09-16), so the extension is fixed rather than
+ * sniffed - see `isPaperUti`. */
+export function decodePaperFilename(field: CloudKitFieldValue | undefined, recordName: string): string {
+  if (field && typeof field.value === "string") {
+    try {
+      const name = Buffer.from(field.value, "base64").toString("utf-8");
+      if (name.length > 0) {
+        return `${name}.png`;
+      }
+    } catch {
+      // fall through to the synthesized name
+    }
+  }
+  return `${recordName}.png`;
 }
 
 const UTI_EXTENSIONS: Record<string, string> = {

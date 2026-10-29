@@ -619,6 +619,86 @@ export async function fetchAssetBytes(downloadURL: string): Promise<Buffer> {
   return Buffer.from(await response.arrayBuffer());
 }
 
+/** Verified live 2026-09-16: the response pre-assigns `recordName` for the
+ * record whose field this asset is destined for - the caller must create
+ * that record using *this* recordName, not one of its own choosing. */
+export interface AssetUploadToken {
+  recordName: string;
+  fieldName: string;
+  url: string;
+}
+
+/**
+ * EXPERIMENTAL - unlike every other function in this file, there is no
+ * captured reference traffic behind this one. It mirrors the two-phase
+ * upload Apple documents publicly for api.apple-cloudkit.com (the
+ * token-authenticated sibling of this same
+ * `database/1/<container>/<env>/<db>/<operation>` URL family): request a
+ * one-time upload URL per Asset-typed field via `assets/upload`, then POST
+ * the bytes there directly. Being tested live against a throwaway note
+ * before any production code path calls it - see dev notes, 2026-09-16.
+ */
+export async function requestAssetUploadTokens(
+  session: IcloudSession,
+  ckDatabaseHost: string,
+  dsid: string,
+  database: CloudKitDatabase,
+  tokens: ReadonlyArray<{ recordType: string; fieldName: string }>,
+): Promise<AssetUploadToken[]> {
+  const body = await postDatabase(
+    "requestAssetUploadTokens:assets/upload",
+    session,
+    ckDatabaseHost,
+    dsid,
+    database,
+    "assets/upload",
+    { tokens },
+  );
+  const parsed = body as { tokens?: AssetUploadToken[] };
+  if (!Array.isArray(parsed.tokens)) {
+    throw new CloudKitRequestFailedError(`assets/upload returned no tokens: ${JSON.stringify(body)}`);
+  }
+  return parsed.tokens;
+}
+
+/** What `uploadAssetBytes` gets back, verified live 2026-09-16: no
+ * `downloadURL` at upload time (the server computes that later, once the
+ * record is actually saved - it's what `parseAssetField` reads back from a
+ * fetched Media record, a different moment than this). This is instead the
+ * receipt you hand back verbatim as the Asset field's value on the
+ * following records/modify save. */
+export interface UploadedAsset {
+  fileChecksum: string;
+  size: number;
+  receipt: string;
+  wrappingKey: string;
+  referenceChecksum: string;
+}
+
+/**
+ * EXPERIMENTAL - see `requestAssetUploadTokens`. Uploads raw bytes to one of
+ * its one-time URLs and returns the receipt to embed in the following
+ * records/modify save.
+ */
+export async function uploadAssetBytes(uploadUrl: string, bytes: Buffer, filename: string): Promise<UploadedAsset> {
+  const form = new FormData();
+  form.set("files", new Blob([new Uint8Array(bytes)]), filename);
+
+  const response = await loggedFetch("uploadAssetBytes", uploadUrl, {
+    method: "POST",
+    headers: {},
+    body: form,
+  });
+  if (!response.ok) {
+    throw new CloudKitRequestFailedError(`Asset upload failed: HTTP ${response.status}: ${await response.text()}`);
+  }
+  const parsed = (await response.json()) as { singleFile?: UploadedAsset };
+  if (!parsed.singleFile) {
+    throw new CloudKitRequestFailedError(`Asset upload response had no singleFile: ${JSON.stringify(parsed)}`);
+  }
+  return parsed.singleFile;
+}
+
 export interface NoteUpdate {
   recordName: string;
   /** Optimistic-concurrency token: the server rejects the update if the

@@ -31,7 +31,17 @@ import { noteDirOf, stateDirIndex, type StateDirInfo } from "../notes/folderLayo
 import { planEmbedRepresentations } from "../notes/embedPushEdit.js";
 import { isEnoent } from "../fsUtil.js";
 import { hasConflictMarkers, mergeNoteVersions } from "../notes/mergeConflict.js";
-import { decodeNoteEmbedSlots, hasAttachmentReference, OBJECT_REPLACEMENT_CHARACTER, type EmbedSlot } from "../notes/noteAttachments.js";
+import {
+  decodeNoteEmbedSlots,
+  findAttachmentReferences,
+  hasAttachmentReference,
+  utiForImageFilename,
+  OBJECT_REPLACEMENT_CHARACTER,
+  type EmbedSlot,
+  type LocalAttachmentReference,
+} from "../notes/noteAttachments.js";
+import { isolateAttachmentPlaceholders, spliceAttachmentEmbeds, type AttachmentPlaceholder } from "../notes/attachmentInsert.js";
+import { uploadNewAttachment } from "../notes/attachmentUpload.js";
 import { hasEmbedMarker, hasUnknownContentMarker } from "../notes/unknownContent.js";
 import { readLocalNote } from "../notes/localFileState.js";
 import { recordEpoch } from "../notes/noteEpoch.js";
@@ -93,6 +103,10 @@ export interface PushOptions {
   dryRun?: boolean;
   /** Routes any headless-recovery login status messages; defaults to staying silent (see `resolveFolderAccount`). */
   onLoginStatus?: (message: string) => void;
+  /** Explicit opt-in escape hatch: treat a tracked attachment whose
+   * reference can't be found locally as removed rather than refusing the
+   * whole note - see `planEmbedRepresentations`'s doc comment. */
+  allowAttachmentRemoval?: boolean;
 }
 
 /** A planned entry plus (for a real, non-dry-run push) what actually
@@ -204,7 +218,13 @@ export interface BuildPushPlanResult {
  */
 export async function buildPushPlan(
   targetDir: string,
-  options: { onLoginStatus?: ((message: string) => void) | undefined } = {},
+  options: {
+    onLoginStatus?: ((message: string) => void) | undefined;
+    /** Explicit opt-in escape hatch: treat a tracked attachment whose
+     * reference can't be found locally as removed rather than refusing the
+     * whole note - see `planEmbedRepresentations`'s doc comment. */
+    allowAttachmentRemoval?: boolean | undefined;
+  } = {},
 ): Promise<BuildPushPlanResult> {
   const state = await openVault(targetDir, migrationReporter(options.onLoginStatus));
   if (!state) {
@@ -361,25 +381,34 @@ export async function buildPushPlan(
       continue;
     }
     // A note that doesn't already have a tracked attachment but whose text
-    // now contains an "attachments/..." reference was hand-typed (or
-    // copy-pasted), not produced by `clone`/`pull` - there's no real file to
-    // upload behind it. A note that *does* already have a tracked attachment
-    // is caught more specifically below, once we have the remote record to
-    // point at. Table attachments aren't tracked in state.attachments at all
-    // (see `attachmentSync.ts`), so this check never fires for them.
+    // now contains an "attachments/..." reference is either a real pasted
+    // image (a new file genuinely sitting in the note's attachments/
+    // directory, ready to upload) or a hand-typed/copy-pasted reference with
+    // no file behind it at all. A note that *does* already have a tracked
+    // attachment is caught more specifically below, once we have the remote
+    // record to point at. Table attachments aren't tracked in
+    // state.attachments at all (see `attachmentSync.ts`), so this check
+    // never fires for them.
+    //
+    // This is a cheap, file-existence-only pre-check; `prepareUpdate` does
+    // the authoritative check (against the fully reconciled body text) and
+    // the actual upload once it has the live remote record.
     const notePreviouslyHadAttachments = Object.values(state.attachments ?? {}).some(
       (attachment) => attachment.noteRecordName === recordName,
     );
     if (!notePreviouslyHadAttachments && hasAttachmentReference(localText)) {
-      entries.push({
-        kind: "update",
-        file: entry.file,
-        resolution: "refused",
-        reason:
-          'contains an "attachments/..." reference, but this tool can\'t upload new attachments - ' +
-          `remove it, or run "icloud-md restore ${entry.file}" to discard the edit.`,
-      });
-      continue;
+      const unresolvable = await findUnresolvableAttachmentReferences(targetDir, entry.file, localText);
+      if (unresolvable.length > 0) {
+        entries.push({
+          kind: "update",
+          file: entry.file,
+          resolution: "refused",
+          reason:
+            `contains an "attachments/..." reference this tool can't resolve to a real local image file ` +
+            `(${unresolvable.join(", ")}) - remove it, or run "icloud-md restore ${entry.file}" to discard the edit.`,
+        });
+        continue;
+      }
     }
     updateCandidates.push({ recordName, entry, localText, frontmatter, requestedTitle, titleOnly });
   }
@@ -708,13 +737,18 @@ export async function buildPushPlan(
       continue;
     }
     if (hasAttachmentReference(localText)) {
-      entries.push({
-        kind: "create",
-        file,
-        resolution: "refused",
-        reason: 'contains an "attachments/..." reference, but this tool can\'t upload new attachments - remove it first.',
-      });
-      continue;
+      const unresolvable = await findUnresolvableAttachmentReferences(targetDir, file, localText);
+      if (unresolvable.length > 0) {
+        entries.push({
+          kind: "create",
+          file,
+          resolution: "refused",
+          reason:
+            `contains an "attachments/..." reference this tool can't resolve to a real local image file ` +
+            `(${unresolvable.join(", ")}) - remove it first.`,
+        });
+        continue;
+      }
     }
     createCandidates.push({
       file,
@@ -995,6 +1029,13 @@ export async function buildPushPlan(
   }
 
   for (const { file, localText, folderRecordName, sharedZoneOwner } of createCandidates) {
+    // Generated up front rather than inside `execute`, so a new attachment's
+    // Note reference (created during planning, below) can point at the
+    // right id from the start - client-generated lowercase-UUID recordName,
+    // matching the captured create (the live vault also has uppercase ones,
+    // so casing likely doesn't matter - but lowercase is what the capture
+    // shows).
+    const recordName = randomUUID();
     // The document is built and decode-verified during planning (not at
     // execute time) so `status` shows a build failure as a refusal, with
     // the same fidelity the update path's plan-time gates have. The local
@@ -1018,30 +1059,91 @@ export async function buildPushPlan(
         titleMode === "filename"
           ? restoreTitleParagraphText(titleParagraphFromFilename(titleExpressedByFile(file, recordedTitles)), parsed.paragraphs)
           : parsed;
-      const doc = buildInitialNoteDocument(desired.text, replicaIdBytes);
-      const reconciled = reconcileNoteFormat(doc, desired.paragraphs, replicaIdBytes);
-      if (!reconciled.ok) {
-        entries.push({ kind: "create", file, resolution: "refused", reason: reconciled.reason });
-        continue;
+
+      const newAttachmentRefs = findAttachmentReferences(desired.text);
+      if (newAttachmentRefs.length > 0) {
+        // A brand-new note with an image from the start (the common case -
+        // pasting a screenshot into a note you just started). No formatting
+        // reconciliation here: `desired.paragraphs`' offsets are into the
+        // *markdown* text, which substituting each reference for a single
+        // U+FFFC just changed the length of - skip it for this note rather
+        // than risk misapplying formatting at the wrong offsets.
+        const zone = noteZone(sharedZoneOwner);
+        let text = desired.text;
+        const placeholders: AttachmentPlaceholder[] = [];
+        let failure: string | undefined;
+        for (const ref of newAttachmentRefs) {
+          const index = text.indexOf(ref.match);
+          const typeUti = utiForImageFilename(ref.relativeFile);
+          if (index === -1 || typeUti === undefined) {
+            failure = `couldn't resolve "${ref.relativeFile}" to a real local image file`;
+            break;
+          }
+          try {
+            const uploaded = await uploadNewAttachment({
+              session,
+              ckdatabasewsUrl,
+              dsid,
+              database: zone.database,
+              zoneID: zone.zoneID,
+              noteId: recordName,
+              noteAlreadyExists: false,
+              absoluteFilePath: path.join(targetDir, path.dirname(file), ref.relativeFile),
+              filename: path.basename(ref.relativeFile),
+              typeUti,
+            });
+            text = text.slice(0, index) + OBJECT_REPLACEMENT_CHARACTER + text.slice(index + ref.match.length);
+            placeholders.push({ placeholderIndex: index, attachmentId: uploaded.attachmentId, typeUti: uploaded.typeUti });
+          } catch (cause) {
+            failure = `couldn't upload "${ref.relativeFile}" - ${cause instanceof Error ? cause.message : cause}`;
+            break;
+          }
+        }
+        if (failure !== undefined) {
+          entries.push({ kind: "create", file, resolution: "refused", reason: failure });
+          continue;
+        }
+        const doc = buildInitialNoteDocument(text, replicaIdBytes);
+        isolateAttachmentPlaceholders(doc, placeholders);
+        validateDocumentInvariants(doc);
+        const raw = encodeNoteDocument(doc);
+        if (!noteDocumentRoundTrips(raw)) {
+          entries.push({
+            kind: "create",
+            file,
+            resolution: "refused",
+            reason: "built document failed decode verification - refusing to create",
+          });
+          continue;
+        }
+        payloadBase64 = compressNoteDocument(raw).toString("base64");
+        plainText = text;
+      } else {
+        const doc = buildInitialNoteDocument(desired.text, replicaIdBytes);
+        const reconciled = reconcileNoteFormat(doc, desired.paragraphs, replicaIdBytes);
+        if (!reconciled.ok) {
+          entries.push({ kind: "create", file, resolution: "refused", reason: reconciled.reason });
+          continue;
+        }
+        const compressed = compressNoteDocument(encodeNoteDocument(doc));
+        const rebuiltString = decodeNoteString(compressed);
+        const rebuiltFormat = decodeNoteFormat(rebuiltString.string, rebuiltString.attributeRun);
+        if (
+          rebuiltString.string !== desired.text ||
+          rebuiltFormat.status !== "ok" ||
+          !formatsRoundTripEqual(rebuiltFormat.paragraphs, desired.paragraphs)
+        ) {
+          entries.push({
+            kind: "create",
+            file,
+            resolution: "refused",
+            reason: "built document failed decode verification - refusing to create",
+          });
+          continue;
+        }
+        payloadBase64 = compressed.toString("base64");
+        plainText = desired.text;
       }
-      const compressed = compressNoteDocument(encodeNoteDocument(doc));
-      const rebuiltString = decodeNoteString(compressed);
-      const rebuiltFormat = decodeNoteFormat(rebuiltString.string, rebuiltString.attributeRun);
-      if (
-        rebuiltString.string !== desired.text ||
-        rebuiltFormat.status !== "ok" ||
-        !formatsRoundTripEqual(rebuiltFormat.paragraphs, desired.paragraphs)
-      ) {
-        entries.push({
-          kind: "create",
-          file,
-          resolution: "refused",
-          reason: "built document failed decode verification - refusing to create",
-        });
-        continue;
-      }
-      payloadBase64 = compressed.toString("base64");
-      plainText = desired.text;
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       entries.push({ kind: "create", file, resolution: "refused", reason: message });
@@ -1058,10 +1160,6 @@ export async function buildPushPlan(
         if (failedFolders.has(folderRecordName)) {
           return { succeeded: false, message: `${file}: skipped - the folder it belongs in could not be created` };
         }
-        // Client-generated lowercase-UUID recordName, matching the captured
-        // create (the live vault also has uppercase ones, so casing likely
-        // doesn't matter - but lowercase is what the capture shows).
-        const recordName = randomUUID();
         const zone = noteZone(sharedZoneOwner);
         const result = await createNoteRecord(
           session,
@@ -1203,10 +1301,10 @@ export async function buildPushPlan(
     const summary: PushSummary = { conflicts: [], refused: [] };
     const conflictsBefore = summary.conflicts.length;
     const refusedBefore = summary.refused.length;
-    const trackedFileAttachmentIds = new Set(
+    const trackedFileAttachments = new Map(
       Object.entries(state.attachments ?? {})
         .filter(([, attachment]) => attachment.noteRecordName === recordName)
-        .map(([attachmentRecordName]) => attachmentRecordName),
+        .map(([attachmentRecordName, attachment]) => [attachmentRecordName, attachment.file] as const),
     );
     const prepared = await prepareUpdate(
       session,
@@ -1217,12 +1315,13 @@ export async function buildPushPlan(
       record,
       entry,
       localText,
-      trackedFileAttachmentIds,
+      trackedFileAttachments,
       replicaIdBytes,
       modificationDateMs,
       titleMode,
       summary,
       requestedTitle,
+      options.allowAttachmentRemoval === true,
     );
     if (!prepared) {
       const newConflict = summary.conflicts[conflictsBefore];
@@ -1392,7 +1491,10 @@ export async function planRemoteChangedMerge(
  */
 export async function runPush(targetDir: string, options: PushOptions = {}): Promise<PushResult> {
   const dryRun = options.dryRun === true;
-  const { state, entries, notices } = await buildPushPlan(targetDir, { onLoginStatus: options.onLoginStatus });
+  const { state, entries, notices } = await buildPushPlan(targetDir, {
+    onLoginStatus: options.onLoginStatus,
+    allowAttachmentRemoval: options.allowAttachmentRemoval,
+  });
   const unchanged = countUnchangedNotes(entries, Object.keys(state.notes).length);
 
   if (entries.length === 0) {
@@ -1459,6 +1561,127 @@ async function listUntrackedMarkdownFiles(targetDir: string, state: CloneState):
   return found.sort();
 }
 
+/** Checks each `attachments/...` reference in `text` against the real
+ * filesystem (relative to the note's own directory) and against a
+ * recognized image extension, returning the ones that don't resolve to a
+ * real local file - the only ones push refuses on sight. A reference that
+ * does resolve becomes a to-be-uploaded new attachment (see
+ * `prepareNewAttachmentUpdate`). */
+async function findUnresolvableAttachmentReferences(
+  targetDir: string,
+  noteFile: string,
+  text: string,
+): Promise<string[]> {
+  const unresolvable: string[] = [];
+  for (const ref of findAttachmentReferences(text)) {
+    if (utiForImageFilename(ref.relativeFile) === undefined) {
+      unresolvable.push(ref.match);
+      continue;
+    }
+    const absolutePath = path.join(targetDir, path.dirname(noteFile), ref.relativeFile);
+    if (!(await pathExists(absolutePath))) {
+      unresolvable.push(ref.match);
+    }
+  }
+  return unresolvable;
+}
+
+async function pathExists(absolutePath: string): Promise<boolean> {
+  try {
+    await stat(absolutePath);
+    return true;
+  } catch (cause) {
+    if (isEnoent(cause)) {
+      return false;
+    }
+    throw cause;
+  }
+}
+
+/**
+ * Uploads every new local attachment `refs` names and returns the fully
+ * spliced Note document ready to push, or undefined (with the reason
+ * recorded in `summary`) if any of it fails. Left-to-right document order:
+ * each ref's U+FFFC lands exactly where its markdown reference sat in
+ * `desiredText`, computed by substituting one at a time so later offsets
+ * stay correct as earlier substitutions shrink the string.
+ */
+async function prepareNewAttachmentUpdate(
+  session: IcloudSession,
+  ckdatabasewsUrl: string,
+  dsid: string,
+  zone: NoteZone,
+  targetDir: string,
+  record: CloudKitRecord,
+  noteFile: string,
+  desiredText: string,
+  refs: readonly LocalAttachmentReference[],
+  replicaId: Uint8Array,
+  summary: PushSummary,
+): Promise<{ text: string; raw: Uint8Array } | undefined> {
+  const textField = record.fields.TextDataEncrypted;
+  if (!textField || typeof textField.value !== "string") {
+    summary.refused.push(`${noteFile}: remote note has no readable text data`);
+    return undefined;
+  }
+  const originalRaw = decompressNoteDocument(Buffer.from(textField.value, "base64"));
+  if (!noteDocumentRoundTrips(originalRaw)) {
+    summary.refused.push(`${noteFile}: remote note's document doesn't round-trip through this tool's model - refusing to touch it`);
+    return undefined;
+  }
+
+  let text = desiredText;
+  const placeholders: AttachmentPlaceholder[] = [];
+  for (const ref of refs) {
+    const index = text.indexOf(ref.match);
+    if (index === -1) {
+      summary.refused.push(`${noteFile}: internal error splicing "${ref.match}" - refusing to push`);
+      return undefined;
+    }
+    const typeUti = utiForImageFilename(ref.relativeFile);
+    if (typeUti === undefined) {
+      summary.refused.push(`${noteFile}: "${ref.relativeFile}" isn't a recognized image type - remove it or push it as-is later`);
+      return undefined;
+    }
+    const absoluteFilePath = path.join(targetDir, path.dirname(noteFile), ref.relativeFile);
+    let uploaded;
+    try {
+      uploaded = await uploadNewAttachment({
+        session,
+        ckdatabasewsUrl,
+        dsid,
+        database: zone.database,
+        zoneID: zone.zoneID,
+        noteId: record.recordName,
+        noteAlreadyExists: true,
+        absoluteFilePath,
+        filename: path.basename(ref.relativeFile),
+        typeUti,
+      });
+    } catch (cause) {
+      summary.refused.push(`${noteFile}: couldn't upload "${ref.relativeFile}" - ${cause instanceof Error ? cause.message : cause}`);
+      return undefined;
+    }
+    text = text.slice(0, index) + OBJECT_REPLACEMENT_CHARACTER + text.slice(index + ref.match.length);
+    placeholders.push({ placeholderIndex: index, attachmentId: uploaded.attachmentId, typeUti: uploaded.typeUti });
+  }
+
+  let raw: Uint8Array;
+  try {
+    raw = spliceAttachmentEmbeds(originalRaw, text, placeholders, replicaId);
+  } catch (cause) {
+    summary.refused.push(
+      `${noteFile}: couldn't splice the new attachment(s) into the note body - ${cause instanceof Error ? cause.message : cause}`,
+    );
+    return undefined;
+  }
+  if (!noteDocumentRoundTrips(raw)) {
+    summary.refused.push(`${noteFile}: the spliced document doesn't round-trip - refusing to push a document this tool can't verify`);
+    return undefined;
+  }
+  return { text, raw };
+}
+
 /**
  * Builds and verifies every record update one candidate needs (the Note
  * record's own text, any table attachments, or both), or undefined (with
@@ -1475,12 +1698,13 @@ async function prepareUpdate(
   record: CloudKitRecord,
   entry: CloneStateNoteEntry,
   localText: string,
-  trackedFileAttachmentIds: ReadonlySet<string>,
+  trackedFileAttachments: ReadonlyMap<string, string>,
   replicaId: Uint8Array,
   modificationDateMs: number,
   titleMode: TitleMode,
   summary: PushSummary,
   requestedTitle?: string | undefined,
+  allowAttachmentRemoval = false,
 ): Promise<PreparedCandidate | undefined> {
   // The mode has to reach the classifier, not just this function: it decides
   // whether `markdownText` (which the local file is a copy of) omits the
@@ -1510,11 +1734,12 @@ async function prepareUpdate(
       classified,
       entry,
       localText,
-      trackedFileAttachmentIds,
+      trackedFileAttachments,
       replicaId,
       modificationDateMs,
       summary,
       requestedTitle,
+      allowAttachmentRemoval,
     );
   }
 
@@ -1527,6 +1752,42 @@ async function prepareUpdate(
   if (!desired) {
     return undefined;
   }
+
+  // classified.embedSlots is empty on this path (a non-empty one returns via
+  // prepareEmbedCandidate above), so any "attachments/..." reference here is
+  // necessarily new - a real local file this tool hasn't uploaded yet, once
+  // findUnresolvableAttachmentReferences let it past the early gate.
+  const newAttachmentRefs = findAttachmentReferences(desired.text);
+  if (newAttachmentRefs.length > 0) {
+    const spliced = await prepareNewAttachmentUpdate(
+      session,
+      ckdatabasewsUrl,
+      dsid,
+      zone,
+      targetDir,
+      record,
+      entry.file,
+      desired.text,
+      newAttachmentRefs,
+      replicaId,
+      summary,
+    );
+    if (!spliced) {
+      return undefined;
+    }
+    const attachmentFields = buildNoteUpdateFields(
+      record,
+      compressNoteDocument(spliced.raw).toString("base64"),
+      spliced.text,
+      modificationDateMs,
+    );
+    return {
+      updates: [noteRecordUpdate(record, entry, attachmentFields)],
+      noteTextUpdated: true,
+      retitledTo: requestedRetitle(classified, requestedTitle),
+    };
+  }
+
   const textUpdate = prepareNoteTextUpdate(record, classified.bodyText, desired, classified.embedSlots, replicaId, entry, summary);
   if (!textUpdate) {
     return undefined;
@@ -1568,13 +1829,20 @@ async function prepareEmbedCandidate(
   classified: OkNoteRecordResult,
   entry: CloneStateNoteEntry,
   localText: string,
-  trackedFileAttachmentIds: ReadonlySet<string>,
+  trackedFileAttachments: ReadonlyMap<string, string>,
   replicaId: Uint8Array,
   modificationDateMs: number,
   summary: PushSummary,
   requestedTitle?: string | undefined,
+  allowAttachmentRemoval = false,
 ): Promise<PreparedCandidate | undefined> {
-  const plan = planEmbedRepresentations(localText, classified.embedSlots, trackedFileAttachmentIds);
+  const plan = planEmbedRepresentations(
+    localText,
+    classified.embedSlots,
+    trackedFileAttachments,
+    noteDirOf(entry.file),
+    allowAttachmentRemoval,
+  );
   if (!plan.ok) {
     summary.refused.push(`${entry.file}: ${plan.reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
     return undefined;
@@ -1662,17 +1930,49 @@ async function prepareEmbedCandidate(
   const retitledTo = requestedRetitle(classified, requestedTitle);
   let noteTextUpdated = false;
   if (plan.reconstructedBodyText !== classified.markdownText || retitledTo !== undefined) {
-    const textUpdate = prepareNoteTextUpdate(record, classified.bodyText, desired, classified.embedSlots, replicaId, entry, summary);
-    if (!textUpdate) {
-      return undefined;
-    }
-    if (textUpdate.status === "ok") {
-      const fields = buildNoteUpdateFields(record, textUpdate.payloadBase64, desired.text, modificationDateMs);
-      updates.unshift(noteRecordUpdate(record, entry, fields));
+    // Every *existing* slot is already a U+FFFC in desired.text (that's what
+    // planEmbedRepresentations just did), so any literal "attachments/..."
+    // markdown reference still standing here is unambiguously new - a real
+    // pasted image, not a stale marker.
+    const newAttachmentRefs = findAttachmentReferences(desired.text);
+    if (newAttachmentRefs.length > 0) {
+      const spliced = await prepareNewAttachmentUpdate(
+        session,
+        ckdatabasewsUrl,
+        dsid,
+        zone,
+        targetDir,
+        record,
+        entry.file,
+        desired.text,
+        newAttachmentRefs,
+        replicaId,
+        summary,
+      );
+      if (!spliced) {
+        return undefined;
+      }
+      const attachmentFields = buildNoteUpdateFields(
+        record,
+        compressNoteDocument(spliced.raw).toString("base64"),
+        spliced.text,
+        modificationDateMs,
+      );
+      updates.unshift(noteRecordUpdate(record, entry, attachmentFields));
       noteTextUpdated = true;
+    } else {
+      const textUpdate = prepareNoteTextUpdate(record, classified.bodyText, desired, classified.embedSlots, replicaId, entry, summary);
+      if (!textUpdate) {
+        return undefined;
+      }
+      if (textUpdate.status === "ok") {
+        const fields = buildNoteUpdateFields(record, textUpdate.payloadBase64, desired.text, modificationDateMs);
+        updates.unshift(noteRecordUpdate(record, entry, fields));
+        noteTextUpdated = true;
+      }
+      // "unchanged": the markdown differs only cosmetically from the remote
+      // rendering - no note-text update needed (tables may still update).
     }
-    // "unchanged": the markdown differs only cosmetically from the remote
-    // rendering - no note-text update needed (tables may still update).
   }
 
   if (updates.length === 0) {
