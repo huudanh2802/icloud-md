@@ -302,6 +302,14 @@ async function launchWithLazyChromiumInstall(
   headless: boolean,
   status: (message: string) => void,
 ): Promise<BrowserContext> {
+  // Windows always ships Edge; using it skips the one-time Chromium download.
+  if (process.platform === "win32") {
+    try {
+      return await chromium.launchPersistentContext(profileDir, { headless, viewport: null, channel: "msedge" });
+    } catch {
+      // Edge missing or unusable: fall through to Playwright's Chromium.
+    }
+  }
   try {
     return await chromium.launchPersistentContext(profileDir, { headless, viewport: null });
   } catch (cause) {
