@@ -202,6 +202,12 @@ export function noteDocumentRoundTrips(raw: Uint8Array): boolean {
 export interface ApplyTextEditOptions {
   /** 16-byte replica UUID identifying this tool's edits in the CRDT. */
   replicaId: Uint8Array;
+  /** Exact splices to apply instead of diffing old against new text
+   * (ascending, non-overlapping, in old-text offsets). For edits where the
+   * diff would be ambiguous about *which* character goes - deleting one of
+   * several identical U+FFFC embed placeholders - the caller says. They
+   * must turn the old text into `newText` exactly, or this throws. */
+  splices?: readonly Splice[] | undefined;
 }
 
 /**
@@ -229,7 +235,16 @@ export function applyTextEdit(doc: NoteDocument, newText: string, options: Apply
   }
   validateDocumentInvariants(doc);
 
-  const splices = computeSplices(oldText, newText);
+  const splices = options.splices ?? computeSplices(oldText, newText);
+  if (options.splices) {
+    let applied = oldText;
+    for (const splice of [...options.splices].reverse()) {
+      applied = applied.slice(0, splice.start) + splice.insertText + applied.slice(splice.start + splice.deleteLength);
+    }
+    if (applied !== newText) {
+      throw new Error("Explicit splices don't produce the requested text - refusing to edit");
+    }
+  }
   const replicaIndex = ensureReplica(doc, options.replicaId);
   // Apple's TTMergeableString captures its style clock once per save pass
   // (generateIdsForLocalChanges reads `_replicaStyleClock` into a local
@@ -484,7 +499,7 @@ function encodeReplicaEntry(entry: ReplicaEntry): GenReplicaClockTable {
 
 // --- editing ---------------------------------------------------------------
 
-interface Splice {
+export interface Splice {
   start: number;
   deleteLength: number;
   insertText: string;

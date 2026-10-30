@@ -170,6 +170,10 @@ interface PreparedCandidate {
    * one the note didn't already have - what the plan entry's remark reports.
    * Undefined for the ordinary content update, which changes no title. */
   retitledTo?: string | undefined;
+  /** Tracked attachments this update deletes from the note (only under
+   * --allow-attachment-removal); dropped from `state.attachments` once the
+   * update lands so they aren't reported missing again. */
+  removedAttachmentIds?: string[] | undefined;
 }
 
 /** What actually happened when an `ExecutablePlanEntry.execute` ran: whether
@@ -1392,6 +1396,9 @@ export async function buildPushPlan(
             await applyNoteFileTimes(path.join(targetDir, entry.file), noteResult.record);
           }
         }
+        for (const attachmentId of prepared.removedAttachmentIds ?? []) {
+          delete state.attachments?.[attachmentId];
+        }
         await writeBaseCopy(targetDir, recordName, localText);
         // A whole-note index over what just landed remotely, mirroring
         // `pull`'s own capture - see the "Whole-note coordinated version
@@ -1961,7 +1968,16 @@ async function prepareEmbedCandidate(
       updates.unshift(noteRecordUpdate(record, entry, attachmentFields));
       noteTextUpdated = true;
     } else {
-      const textUpdate = prepareNoteTextUpdate(record, classified.bodyText, desired, classified.embedSlots, replicaId, entry, summary);
+      const textUpdate = prepareNoteTextUpdate(
+        record,
+        classified.bodyText,
+        desired,
+        classified.embedSlots,
+        replicaId,
+        entry,
+        summary,
+        plan.removedAttachmentIds,
+      );
       if (!textUpdate) {
         return undefined;
       }
@@ -1981,7 +1997,12 @@ async function prepareEmbedCandidate(
     // about the note's actual content differs from the last sync.
     return { updates: [], noteTextUpdated: false };
   }
-  return { updates, noteTextUpdated, retitledTo };
+  return {
+    updates,
+    noteTextUpdated,
+    retitledTo,
+    ...(plan.removedAttachmentIds.length > 0 ? { removedAttachmentIds: plan.removedAttachmentIds } : {}),
+  };
 }
 
 /**
@@ -2220,6 +2241,7 @@ function prepareNoteTextUpdate(
   replicaId: Uint8Array,
   entry: CloneStateNoteEntry,
   summary: PushSummary,
+  removedAttachmentIds: readonly string[] = [],
 ): NoteTextUpdate | undefined {
   const textField = record.fields.TextDataEncrypted;
   if (!textField || typeof textField.value !== "string") {
@@ -2245,11 +2267,44 @@ function prepareNoteTextUpdate(
   // tombstoning one (or typing a literal one) would sever the CRDT character
   // its attachmentInfo run points at, even if the visible text ends up with
   // the right placeholder count. Embeds can't be moved through this tool.
-  const spliceTouchesPlaceholder = computeSplices(currentBodyText, desired.text).some(
-    (splice) =>
-      currentBodyText.slice(splice.start, splice.start + splice.deleteLength).includes(OBJECT_REPLACEMENT_CHARACTER) ||
-      splice.insertText.includes(OBJECT_REPLACEMENT_CHARACTER),
+  //
+  // The one exception is an attachment the caller explicitly removed
+  // (`removedAttachmentIds`, from planEmbedRepresentations under
+  // --allow-attachment-removal). Its placeholder is deleted by *position*
+  // first - a text diff can't tell identical U+FFFC characters apart and
+  // could tombstone a neighbouring embed instead - which is the same
+  // tombstone Notes itself writes; adjustAttributeRuns drops its
+  // one-character attachmentInfo run with it. The rest of the edit then
+  // goes from that intermediate text to the desired one under the original
+  // rule: it may not touch any placeholder.
+  const removedIds = new Set(removedAttachmentIds);
+  const placeholderOffsets: number[] = [];
+  for (let i = 0; i < currentBodyText.length; i += 1) {
+    if (currentBodyText[i] === OBJECT_REPLACEMENT_CHARACTER) {
+      placeholderOffsets.push(i);
+    }
+  }
+  const removalSplices = placeholderOffsets
+    .filter((_, slotIndex) => {
+      const slot = expectedSlots[slotIndex];
+      return slot?.kind === "attachment" && removedIds.has(slot.ref.attachmentIdentifier);
+    })
+    .map((start) => ({ start, deleteLength: 1, insertText: "" }));
+  let intermediateText = currentBodyText;
+  for (const splice of [...removalSplices].reverse()) {
+    intermediateText = intermediateText.slice(0, splice.start) + intermediateText.slice(splice.start + 1);
+  }
+  const remainingSlots = expectedSlots.filter(
+    (slot) => !(slot.kind === "attachment" && removedIds.has(slot.ref.attachmentIdentifier)),
   );
+  const spliceTouchesPlaceholder =
+    placeholderOffsets.length !== expectedSlots.length ||
+    removalSplices.length !== removedIds.size ||
+    computeSplices(intermediateText, desired.text).some(
+      (splice) =>
+        intermediateText.slice(splice.start, splice.start + splice.deleteLength).includes(OBJECT_REPLACEMENT_CHARACTER) ||
+        splice.insertText.includes(OBJECT_REPLACEMENT_CHARACTER),
+    );
   if (spliceTouchesPlaceholder) {
     summary.refused.push(
       `${entry.file}: this edit would delete or move an embedded object - embeds can only be edited in Notes itself. ` +
@@ -2264,7 +2319,8 @@ function prepareNoteTextUpdate(
       summary.refused.push(`${entry.file}: decoder disagreement on the note's current text - refusing to edit`);
       return undefined;
     }
-    const textChanged = applyTextEdit(doc, desired.text, { replicaId });
+    const removed = removalSplices.length > 0 && applyTextEdit(doc, intermediateText, { replicaId, splices: removalSplices });
+    const textChanged = applyTextEdit(doc, desired.text, { replicaId }) || removed;
     const reconciled = reconcileNoteFormat(doc, desired.paragraphs, replicaId);
     if (!reconciled.ok) {
       summary.refused.push(
@@ -2283,9 +2339,10 @@ function prepareNoteTextUpdate(
     }
     // The embed structure must have come through the edit untouched - same
     // slots, same order, same identities (this also backstops
-    // `adjustAttributeRuns`'s never-grow-an-attachmentInfo-run guard).
+    // `adjustAttributeRuns`'s never-grow-an-attachmentInfo-run guard) -
+    // except for exactly the attachments the caller removed.
     const rebuiltSlots = decodeNoteEmbedSlots(compressed);
-    if (rebuiltSlots === undefined || !embedSlotsEqual(rebuiltSlots, expectedSlots)) {
+    if (rebuiltSlots === undefined || !embedSlotsEqual(rebuiltSlots, remainingSlots)) {
       summary.refused.push(`${entry.file}: rebuilt document failed embed-structure verification - refusing to push`);
       return undefined;
     }

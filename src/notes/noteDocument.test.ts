@@ -18,6 +18,7 @@ import {
 import { AttributeRunSchema, StringSchema } from "./gen/topotext_pb.js";
 import { DocumentSchema as VersionedDocumentSchema, VersionSchema } from "./gen/versioned_document_pb.js";
 import { decodeNoteBodyText, compressNoteDocument } from "./noteText.js";
+import { decodeNoteEmbedSlots } from "./noteAttachments.js";
 
 const REPLICA_A = new Uint8Array(16).fill(0xaa);
 const REPLICA_B = new Uint8Array(16).fill(0xbb);
@@ -675,4 +676,49 @@ test("appending after a trailing embed grows a fresh run, not the embed's", () =
   assert.equal(doc.attributeRuns[2]?.length, 5);
   assert.equal(doc.attributeRuns[2]?.attachmentInfo, undefined);
   assert.equal(reencodeAndDecode(doc), "a￼ tail");
+});
+
+// --- deleting an embed (push --allow-attachment-removal) ---------------------
+
+test("deleting an embed's placeholder tombstones it and drops its attachmentInfo run", () => {
+  const doc = documentWithEmbed();
+  assert.equal(applyTextEdit(doc, "ab", { replicaId: REPLICA_A }), true);
+
+  validateDocumentInvariants(doc);
+  assert.equal(doc.attributeRuns.some((run) => run.attachmentInfo !== undefined), false);
+  assert.equal(doc.attributeRuns.reduce((n, run) => n + run.length, 0), 2);
+  assert.equal(reencodeAndDecode(doc), "ab");
+  assert.deepEqual(decodeNoteEmbedSlots(compressNoteDocument(encodeNoteDocument(doc))), []);
+});
+
+test("removing the first of several embeds while typing a title keeps the others intact", () => {
+  // The real-world shape: a note that was three pictures, retitled on the
+  // PC with the first picture deleted.
+  const doc = simpleDocument("￼\n￼\n￼");
+  doc.attributeRuns = [
+    create(AttributeRunSchema, { length: 1, attachmentInfo: { attachmentIdentifier: "IMG-1", typeUTI: "public.png" } }),
+    create(AttributeRunSchema, { length: 1 }),
+    create(AttributeRunSchema, { length: 1, attachmentInfo: { attachmentIdentifier: "IMG-2", typeUTI: "public.jpeg" } }),
+    create(AttributeRunSchema, { length: 1 }),
+    create(AttributeRunSchema, { length: 1, attachmentInfo: { attachmentIdentifier: "IMG-3", typeUTI: "public.png" } }),
+  ];
+
+  // Same two steps push takes: remove the chosen placeholder by position (a
+  // diff of "￼\n￼\n￼" against "\n￼\n￼" can't say which ￼ went), then the
+  // ordinary text edit, which touches no placeholder.
+  assert.equal(applyTextEdit(doc, "\n￼\n￼", { replicaId: REPLICA_A, splices: [{ start: 0, deleteLength: 1, insertText: "" }] }), true);
+  assert.equal(applyTextEdit(doc, "Fix notes\n￼\n￼", { replicaId: REPLICA_A }), true);
+
+  validateDocumentInvariants(doc);
+  assert.equal(reencodeAndDecode(doc), "Fix notes\n￼\n￼");
+  const slots = decodeNoteEmbedSlots(compressNoteDocument(encodeNoteDocument(doc)));
+  assert.deepEqual(
+    slots?.map((slot) => (slot.kind === "attachment" ? slot.ref.attachmentIdentifier : slot.kind)),
+    ["IMG-2", "IMG-3"],
+  );
+});
+
+test("explicit splices that don't produce the requested text are rejected", () => {
+  const doc = documentWithEmbed();
+  assert.throws(() => applyTextEdit(doc, "ab", { replicaId: REPLICA_A, splices: [{ start: 0, deleteLength: 1, insertText: "" }] }));
 });
