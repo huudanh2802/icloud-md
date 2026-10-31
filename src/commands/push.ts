@@ -175,6 +175,30 @@ interface PreparedCandidate {
    * --allow-attachment-removal); dropped from `state.attachments` once the
    * update lands so they aren't reported missing again. */
   removedAttachmentIds?: string[] | undefined;
+  /** New attachments this update references, uploaded right before it's
+   * sent (see PendingUpload). */
+  uploads?: PendingUpload[] | undefined;
+}
+
+/** A new local attachment a planned create/update references by a
+ * pre-generated id. Planning only verifies the note body with that id;
+ * the Media + Attachment records are created when the entry executes. */
+interface PendingUpload {
+  relativeFile: string;
+  upload: () => Promise<unknown>;
+}
+
+/** Runs an entry's uploads in order; returns a failure message, or
+ * undefined when they all landed. */
+async function runPendingUploads(uploads: readonly PendingUpload[]): Promise<string | undefined> {
+  for (const pending of uploads) {
+    try {
+      await pending.upload();
+    } catch (cause) {
+      return `couldn't upload "${pending.relativeFile}" - ${cause instanceof Error ? cause.message : String(cause)}`;
+    }
+  }
+  return undefined;
 }
 
 /** What actually happened when an `ExecutablePlanEntry.execute` ran: whether
@@ -1049,6 +1073,10 @@ export async function buildPushPlan(
     // the formatting (Step 2 of the formatting plan).
     let payloadBase64: string;
     let plainText: string;
+    // New attachments are uploaded when this create executes, not while
+    // planning - `status` and `--dry-run` plan too, and a refused plan must
+    // not leave uploaded records behind.
+    let pendingUploads: PendingUpload[] = [];
     try {
       const parsed = parseNoteMarkdown(promoteAttachmentLinks(localText));
       if (parsed.status !== "ok") {
@@ -1077,6 +1105,7 @@ export async function buildPushPlan(
         let text = desired.text;
         const placeholders: AttachmentPlaceholder[] = [];
         let failure: string | undefined;
+        const uploads: PendingUpload[] = [];
         for (const ref of newAttachmentRefs) {
           const index = text.indexOf(ref.match);
           const typeUti = utiForAttachmentFilename(ref.relativeFile);
@@ -1084,26 +1113,28 @@ export async function buildPushPlan(
             failure = `couldn't resolve "${ref.relativeFile}" to a real local file`;
             break;
           }
-          try {
-            const uploaded = await uploadNewAttachment({
-              session,
-              ckdatabasewsUrl,
-              dsid,
-              database: zone.database,
-              zoneID: zone.zoneID,
-              noteId: recordName,
-              noteAlreadyExists: false,
-              absoluteFilePath: path.join(targetDir, path.dirname(file), ref.relativeFile),
-              filename: path.basename(ref.relativeFile),
-              typeUti,
-            });
-            text = text.slice(0, index) + OBJECT_REPLACEMENT_CHARACTER + text.slice(index + ref.match.length);
-            placeholders.push({ placeholderIndex: index, attachmentId: uploaded.attachmentId, typeUti: uploaded.typeUti });
-          } catch (cause) {
-            failure = `couldn't upload "${ref.relativeFile}" - ${cause instanceof Error ? cause.message : cause}`;
-            break;
-          }
+          const attachmentId = randomUUID();
+          uploads.push({
+            relativeFile: ref.relativeFile,
+            upload: () =>
+              uploadNewAttachment({
+                session,
+                ckdatabasewsUrl,
+                dsid,
+                database: zone.database,
+                zoneID: zone.zoneID,
+                noteId: recordName,
+                noteAlreadyExists: false,
+                absoluteFilePath: path.join(targetDir, path.dirname(file), ref.relativeFile),
+                filename: path.basename(ref.relativeFile),
+                typeUti,
+                attachmentId,
+              }),
+          });
+          text = text.slice(0, index) + OBJECT_REPLACEMENT_CHARACTER + text.slice(index + ref.match.length);
+          placeholders.push({ placeholderIndex: index, attachmentId, typeUti });
         }
+        pendingUploads = uploads;
         if (failure !== undefined) {
           entries.push({ kind: "create", file, resolution: "refused", reason: failure });
           continue;
@@ -1166,6 +1197,10 @@ export async function buildPushPlan(
           return { succeeded: false, message: `${file}: skipped - the folder it belongs in could not be created` };
         }
         const zone = noteZone(sharedZoneOwner);
+        const uploadFailure = await runPendingUploads(pendingUploads);
+        if (uploadFailure !== undefined) {
+          return { succeeded: false, message: `${file}: ${uploadFailure}` };
+        }
         const result = await createNoteRecord(
           session,
           ckdatabasewsUrl,
@@ -1367,6 +1402,10 @@ export async function buildPushPlan(
       resolution: "ready",
       ...(prepared.retitledTo !== undefined ? { remark: retitleRemark(prepared.retitledTo) } : {}),
       execute: async () => {
+        const uploadFailure = await runPendingUploads(prepared.uploads ?? []);
+        if (uploadFailure !== undefined) {
+          return { succeeded: false, message: `${entry.file}: ${uploadFailure}` };
+        }
         const results = await updateRecords(session, ckdatabasewsUrl, dsid, zone.database, zone.zoneID, prepared.updates);
         const failure = results.find((result) => !result.ok);
         if (failure && !failure.ok) {
@@ -1622,7 +1661,7 @@ async function prepareNewAttachmentUpdate(
   refs: readonly LocalAttachmentReference[],
   replicaId: Uint8Array,
   summary: PushSummary,
-): Promise<{ text: string; raw: Uint8Array } | undefined> {
+): Promise<{ text: string; raw: Uint8Array; uploads: PendingUpload[] } | undefined> {
   const textField = record.fields.TextDataEncrypted;
   if (!textField || typeof textField.value !== "string") {
     summary.refused.push(`${noteFile}: remote note has no readable text data`);
@@ -1636,6 +1675,7 @@ async function prepareNewAttachmentUpdate(
 
   let text = desiredText;
   const placeholders: AttachmentPlaceholder[] = [];
+  const uploads: PendingUpload[] = [];
   for (const ref of refs) {
     const index = text.indexOf(ref.match);
     if (index === -1) {
@@ -1644,26 +1684,29 @@ async function prepareNewAttachmentUpdate(
     }
     const typeUti = utiForAttachmentFilename(ref.relativeFile);
     const absoluteFilePath = path.join(targetDir, path.dirname(noteFile), ref.relativeFile);
-    let uploaded;
-    try {
-      uploaded = await uploadNewAttachment({
-        session,
-        ckdatabasewsUrl,
-        dsid,
-        database: zone.database,
-        zoneID: zone.zoneID,
-        noteId: record.recordName,
-        noteAlreadyExists: true,
-        absoluteFilePath,
-        filename: path.basename(ref.relativeFile),
-        typeUti,
-      });
-    } catch (cause) {
-      summary.refused.push(`${noteFile}: couldn't upload "${ref.relativeFile}" - ${cause instanceof Error ? cause.message : cause}`);
-      return undefined;
-    }
+    // Planned with a pre-generated id and uploaded only when the update
+    // executes: the splice below is verified first, so a refusal (or a
+    // `status`/`--dry-run`, which plan too) never leaves an orphaned upload.
+    const attachmentId = randomUUID();
+    uploads.push({
+      relativeFile: ref.relativeFile,
+      upload: () =>
+        uploadNewAttachment({
+          session,
+          ckdatabasewsUrl,
+          dsid,
+          database: zone.database,
+          zoneID: zone.zoneID,
+          noteId: record.recordName,
+          noteAlreadyExists: true,
+          absoluteFilePath,
+          filename: path.basename(ref.relativeFile),
+          typeUti,
+          attachmentId,
+        }),
+    });
     text = text.slice(0, index) + OBJECT_REPLACEMENT_CHARACTER + text.slice(index + ref.match.length);
-    placeholders.push({ placeholderIndex: index, attachmentId: uploaded.attachmentId, typeUti: uploaded.typeUti });
+    placeholders.push({ placeholderIndex: index, attachmentId, typeUti });
   }
 
   let raw: Uint8Array;
@@ -1679,7 +1722,7 @@ async function prepareNewAttachmentUpdate(
     summary.refused.push(`${noteFile}: the spliced document doesn't round-trip - refusing to push a document this tool can't verify`);
     return undefined;
   }
-  return { text, raw };
+  return { text, raw, uploads };
 }
 
 /**
@@ -1785,6 +1828,7 @@ async function prepareUpdate(
       updates: [noteRecordUpdate(record, entry, attachmentFields)],
       noteTextUpdated: true,
       retitledTo: requestedRetitle(classified, requestedTitle),
+      uploads: spliced.uploads,
     };
   }
 
@@ -1929,6 +1973,7 @@ async function prepareEmbedCandidate(
   // asked for a new title, and the body comparison alone would drop it.
   const retitledTo = requestedRetitle(classified, requestedTitle);
   let noteTextUpdated = false;
+  let uploads: PendingUpload[] = [];
   if (plan.reconstructedBodyText !== classified.markdownText || retitledTo !== undefined) {
     // Every *existing* slot is already a U+FFFC in desired.text (that's what
     // planEmbedRepresentations just did), so any literal "attachments/..."
@@ -1960,6 +2005,7 @@ async function prepareEmbedCandidate(
       );
       updates.unshift(noteRecordUpdate(record, entry, attachmentFields));
       noteTextUpdated = true;
+      uploads = spliced.uploads;
     } else {
       const textUpdate = prepareNoteTextUpdate(
         record,
@@ -1994,6 +2040,7 @@ async function prepareEmbedCandidate(
     updates,
     noteTextUpdated,
     retitledTo,
+    uploads,
     ...(plan.removedAttachmentIds.length > 0 ? { removedAttachmentIds: plan.removedAttachmentIds } : {}),
   };
 }

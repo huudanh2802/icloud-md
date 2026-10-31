@@ -47,6 +47,10 @@ export interface UploadNewAttachmentOptions {
   absoluteFilePath: string;
   filename: string;
   typeUti: string;
+  /** Pre-generated Attachment recordName. push plans (and verifies) the
+   * note-body splice with this id before anything is uploaded, so the
+   * upload itself can wait until the push actually executes. */
+  attachmentId?: string | undefined;
 }
 
 /**
@@ -88,7 +92,7 @@ export async function uploadNewAttachment(options: UploadNewAttachmentOptions): 
     );
   }
 
-  const attachmentId = randomUUID();
+  const attachmentId = options.attachmentId ?? randomUUID();
   const attachmentResult = await createZoneRecord(
     "Attachment",
     options.session,

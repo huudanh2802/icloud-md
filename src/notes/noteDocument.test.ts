@@ -19,6 +19,7 @@ import { AttributeRunSchema, StringSchema } from "./gen/topotext_pb.js";
 import { DocumentSchema as VersionedDocumentSchema, VersionSchema } from "./gen/versioned_document_pb.js";
 import { decodeNoteBodyText, compressNoteDocument } from "./noteText.js";
 import { decodeNoteEmbedSlots } from "./noteAttachments.js";
+import { isolateAttachmentPlaceholders } from "./attachmentInsert.js";
 
 const REPLICA_A = new Uint8Array(16).fill(0xaa);
 const REPLICA_B = new Uint8Array(16).fill(0xbb);
@@ -721,4 +722,24 @@ test("removing the first of several embeds while typing a title keeps the others
 test("explicit splices that don't produce the requested text are rejected", () => {
   const doc = documentWithEmbed();
   assert.throws(() => applyTextEdit(doc, "ab", { replicaId: REPLICA_A, splices: [{ start: 0, deleteLength: 1, insertText: "" }] }));
+});
+
+// --- isolating a new attachment's placeholder run ------------------------------
+
+test("a new attachment can land in a paragraph whose style field is unset (Body)", () => {
+  // A paragraphStyle carrying only an indent: its .style reads as 0 (Title)
+  // unless presence is checked - the false refusal seen on a real note.
+  const doc = simpleDocument("ab\n￼");
+  doc.attributeRuns = [
+    create(AttributeRunSchema, { length: 3 }),
+    create(AttributeRunSchema, { length: 1, paragraphStyle: { indent: 1 } }),
+  ];
+  isolateAttachmentPlaceholders(doc, [{ placeholderIndex: 3, attachmentId: "NEW-1", typeUti: "public.png" }]);
+  assert.equal(doc.attributeRuns[1]?.attachmentInfo?.attachmentIdentifier, "NEW-1");
+});
+
+test("a new attachment still refuses to land in a real Title paragraph", () => {
+  const doc = simpleDocument("￼");
+  doc.attributeRuns = [create(AttributeRunSchema, { length: 1, paragraphStyle: { style: 0 } })];
+  assert.throws(() => isolateAttachmentPlaceholders(doc, [{ placeholderIndex: 0, attachmentId: "NEW-2", typeUti: "public.png" }]), /style 0/);
 });

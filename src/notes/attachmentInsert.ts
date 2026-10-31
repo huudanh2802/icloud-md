@@ -14,8 +14,8 @@
  * one piece of this feature verified live rather than against a capture -
  * see dev notes, 2026-09-16.
  */
-import { clone, create } from "@bufbuild/protobuf";
-import { AttachmentInfoSchema, AttributeRunSchema } from "./gen/topotext_pb.js";
+import { clone, create, isFieldSet } from "@bufbuild/protobuf";
+import { AttachmentInfoSchema, AttributeRunSchema, ParagraphStyleSchema } from "./gen/topotext_pb.js";
 import { OBJECT_REPLACEMENT_CHARACTER } from "./noteAttachments.js";
 import {
   applyTextEdit,
@@ -28,6 +28,7 @@ import {
 /** Apple's paragraph-style enum for Body - the plain-prose style every
  * captured embed (table or otherwise) sits in. */
 const BODY_PARAGRAPH_STYLE = 3;
+const PS_STYLE_FIELD = ParagraphStyleSchema.fields.find((f) => f.localName === "style")!;
 
 export interface AttachmentEmbedInsertion {
   /** The note document with the embed spliced in, uncompressed. */
@@ -146,7 +147,11 @@ function isolateAttachmentPlaceholderRun(doc: NoteDocument, placeholderIndex: nu
 
     const placeholder = clone(AttributeRunSchema, run);
     placeholder.length = 1;
-    const style = placeholder.paragraphStyle?.style;
+    // A paragraphStyle without its style field set (e.g. carrying only an
+    // indent) is Body - reading .style there gives proto3's default 0, which
+    // would wrongly look like Title (same rule as noteFormat's paragraphKindOf).
+    const ps = placeholder.paragraphStyle;
+    const style = ps && isFieldSet(ps, PS_STYLE_FIELD) ? ps.style : undefined;
     if (style !== undefined && style !== BODY_PARAGRAPH_STYLE) {
       throw new Error(
         `isolateAttachmentPlaceholderRun: the embed would land in a paragraph of style ${style}; ` +
