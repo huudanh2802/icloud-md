@@ -2,7 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { chromium, type BrowserContext, type Page, type Response as PlaywrightResponse } from "playwright";
+import type { BrowserContext, Page, Response as PlaywrightResponse } from "playwright";
 import { DEFAULT_CLIENT_BUILD_NUMBER, DEFAULT_CLIENT_MASTERING_NUMBER } from "./clientConstants.js";
 import { CONFIG_DIR } from "../configDir.js";
 import { ChromiumNotInstalledError, SignInIncompleteError } from "../errors.js";
@@ -302,6 +302,10 @@ async function launchWithLazyChromiumInstall(
   headless: boolean,
   status: (message: string) => void,
 ): Promise<BrowserContext> {
+  // Loaded here rather than at the top: Playwright costs ~300ms to import,
+  // and every pull/push/status would pay it even though only a sign-in
+  // window ever needs it.
+  const { chromium } = await import("playwright");
   // Windows always ships Edge; using it skips the one-time Chromium download.
   if (process.platform === "win32") {
     try {
