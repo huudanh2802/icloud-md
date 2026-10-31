@@ -205,6 +205,55 @@ export function utiForImageFilename(name: string): string | undefined {
   return EXTENSION_UTIS[ext];
 }
 
+/** Non-image file types Notes attaches as file/audio/video cards. The
+ * Attachment/Media record pair is the same as for an image - only the UTI
+ * differs, and it's what Notes picks the card (and audio player) by. */
+const FILE_EXTENSION_UTIS: Record<string, string> = {
+  ".m4a": "com.apple.m4a-audio",
+  ".mp3": "public.mp3",
+  ".wav": "com.microsoft.waveform-audio",
+  ".aac": "public.aac-audio",
+  ".aif": "public.aiff-audio",
+  ".aiff": "public.aiff-audio",
+  ".mp4": "public.mpeg-4",
+  ".m4v": "com.apple.m4v-video",
+  ".mov": "com.apple.quicktime-movie",
+  ".pdf": "com.adobe.pdf",
+  ".txt": "public.plain-text",
+  ".rtf": "public.rtf",
+  ".csv": "public.comma-separated-values-text",
+  ".json": "public.json",
+  ".zip": "public.zip-archive",
+  ".doc": "com.microsoft.word.doc",
+  ".docx": "org.openxmlformats.wordprocessingml.document",
+  ".xls": "com.microsoft.excel.xls",
+  ".xlsx": "org.openxmlformats.spreadsheetml.sheet",
+  ".ppt": "com.microsoft.powerpoint.ppt",
+  ".pptx": "org.openxmlformats.presentationml.presentation",
+  ".pages": "com.apple.iwork.pages.sffpages",
+  ".numbers": "com.apple.iwork.numbers.sffnumbers",
+  ".key": "com.apple.iwork.keynote.sffkey",
+};
+
+/** Rewrites plain links into the vault's attachments folder
+ * (`[Report.pdf](attachments/Report.pdf)` - how files, audio and documents
+ * are written, and how pull renders them) into the `![..](..)` form, which
+ * is the only shape the markdown parser keeps verbatim for push to find and
+ * upload; a plain link would otherwise go up as a hyperlink to nowhere.
+ * Callers apply it only to text whose *existing* attachments have already
+ * been spliced down to U+FFFC, so it only ever touches new ones. */
+export function promoteAttachmentLinks(text: string): string {
+  return text.replace(/(^|[^!\\])\[([^\]]*)\]\((attachments\/[^)\s]+)\)/gm, "$1![$2]($3)");
+}
+
+/** UTI to upload any local attachment file as: images by their own type,
+ * known documents/media by theirs, anything else as a generic file
+ * (`public.data`, which Notes shows as a plain file card). */
+export function utiForAttachmentFilename(name: string): string {
+  const ext = path.extname(name).toLowerCase();
+  return EXTENSION_UTIS[ext] ?? FILE_EXTENSION_UTIS[ext] ?? "public.data";
+}
+
 /** The markdown embed (images) or link (everything else) for one resolved
  * file attachment, pointing at its downloaded file under `attachments/`. */
 export function formatAttachmentMarkdown(ref: AttachmentReference, relativeFile: string): string {
@@ -323,6 +372,24 @@ const UTI_EXTENSIONS: Record<string, string> = {
   "public.webp": ".webp",
   "com.apple.m4a-audio": ".m4a",
   "com.adobe.pdf": ".pdf",
+  "public.mp3": ".mp3",
+  "com.microsoft.waveform-audio": ".wav",
+  "public.aac-audio": ".aac",
+  "public.aiff-audio": ".aiff",
+  "public.mpeg-4": ".mp4",
+  "com.apple.m4v-video": ".m4v",
+  "com.apple.quicktime-movie": ".mov",
+  "public.plain-text": ".txt",
+  "public.rtf": ".rtf",
+  "public.comma-separated-values-text": ".csv",
+  "public.json": ".json",
+  "public.zip-archive": ".zip",
+  "com.microsoft.word.doc": ".doc",
+  "org.openxmlformats.wordprocessingml.document": ".docx",
+  "com.microsoft.excel.xls": ".xls",
+  "org.openxmlformats.spreadsheetml.sheet": ".xlsx",
+  "com.microsoft.powerpoint.ppt": ".ppt",
+  "org.openxmlformats.presentationml.presentation": ".pptx",
 };
 
 function extensionForUti(typeUti: string): string {

@@ -6,6 +6,8 @@ import { DocumentSchema as VersionedDocumentSchema, VersionSchema } from "./gen/
 import { compressNoteDocument } from "./noteText.js";
 import {
   decodeAttachmentFilename,
+  utiForAttachmentFilename,
+  promoteAttachmentLinks,
   decodeNoteAttachmentRefs,
   decodeNoteEmbedSlots,
   decodePaperFilename,
@@ -220,4 +222,23 @@ test("hasAttachmentReference detects a hand-typed attachments/ link or embed", (
   assert.equal(hasAttachmentReference("See [file](attachments/notes.pdf) above"), true);
   assert.equal(hasAttachmentReference("Just plain text"), false);
   assert.equal(hasAttachmentReference("A [normal link](https://example.com) is fine"), false);
+});
+
+test("utiForAttachmentFilename maps images, media and documents, and falls back to public.data", () => {
+  assert.equal(utiForAttachmentFilename("attachments/Photo.JPG"), "public.jpeg");
+  assert.equal(utiForAttachmentFilename("attachments/Memo.m4a"), "com.apple.m4a-audio");
+  assert.equal(utiForAttachmentFilename("attachments/song.mp3"), "public.mp3");
+  assert.equal(utiForAttachmentFilename("attachments/Scan.pdf"), "com.adobe.pdf");
+  assert.equal(utiForAttachmentFilename("attachments/Report.docx"), "org.openxmlformats.wordprocessingml.document");
+  assert.equal(utiForAttachmentFilename("attachments/archive.7z"), "public.data");
+});
+
+test("promoteAttachmentLinks turns plain attachment links into the uploadable form, nothing else", () => {
+  assert.equal(
+    promoteAttachmentLinks("Memo:\n[Memo.m4a](attachments/Memo.m4a) and [site](https://x.dev)\n![a.png](attachments/a.png)"),
+    "Memo:\n![Memo.m4a](attachments/Memo.m4a) and [site](https://x.dev)\n![a.png](attachments/a.png)",
+  );
+  assert.equal(promoteAttachmentLinks("[Report.pdf](attachments/Report%20Q3.pdf)"), "![Report.pdf](attachments/Report%20Q3.pdf)");
+  // An escaped bracket is literal text, not a link.
+  assert.equal(promoteAttachmentLinks(String.raw`\[not](attachments/x.pdf)`), String.raw`\[not](attachments/x.pdf)`);
 });

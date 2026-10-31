@@ -35,7 +35,8 @@ import {
   decodeNoteEmbedSlots,
   findAttachmentReferences,
   hasAttachmentReference,
-  utiForImageFilename,
+  utiForAttachmentFilename,
+  promoteAttachmentLinks,
   OBJECT_REPLACEMENT_CHARACTER,
   type EmbedSlot,
   type LocalAttachmentReference,
@@ -408,7 +409,7 @@ export async function buildPushPlan(
           file: entry.file,
           resolution: "refused",
           reason:
-            `contains an "attachments/..." reference this tool can't resolve to a real local image file ` +
+            `contains an "attachments/..." reference this tool can't resolve to a real local file ` +
             `(${unresolvable.join(", ")}) - remove it, or run "icloud-md restore ${entry.file}" to discard the edit.`,
         });
         continue;
@@ -748,7 +749,7 @@ export async function buildPushPlan(
           file,
           resolution: "refused",
           reason:
-            `contains an "attachments/..." reference this tool can't resolve to a real local image file ` +
+            `contains an "attachments/..." reference this tool can't resolve to a real local file ` +
             `(${unresolvable.join(", ")}) - remove it first.`,
         });
         continue;
@@ -1049,7 +1050,7 @@ export async function buildPushPlan(
     let payloadBase64: string;
     let plainText: string;
     try {
-      const parsed = parseNoteMarkdown(localText);
+      const parsed = parseNoteMarkdown(promoteAttachmentLinks(localText));
       if (parsed.status !== "ok") {
         entries.push({ kind: "create", file, resolution: "refused", reason: parsed.reason });
         continue;
@@ -1078,9 +1079,9 @@ export async function buildPushPlan(
         let failure: string | undefined;
         for (const ref of newAttachmentRefs) {
           const index = text.indexOf(ref.match);
-          const typeUti = utiForImageFilename(ref.relativeFile);
-          if (index === -1 || typeUti === undefined) {
-            failure = `couldn't resolve "${ref.relativeFile}" to a real local image file`;
+          const typeUti = utiForAttachmentFilename(ref.relativeFile);
+          if (index === -1) {
+            failure = `couldn't resolve "${ref.relativeFile}" to a real local file`;
             break;
           }
           try {
@@ -1581,10 +1582,6 @@ async function findUnresolvableAttachmentReferences(
 ): Promise<string[]> {
   const unresolvable: string[] = [];
   for (const ref of findAttachmentReferences(text)) {
-    if (utiForImageFilename(ref.relativeFile) === undefined) {
-      unresolvable.push(ref.match);
-      continue;
-    }
     const absolutePath = path.join(targetDir, path.dirname(noteFile), ref.relativeFile);
     if (!(await pathExists(absolutePath))) {
       unresolvable.push(ref.match);
@@ -1645,11 +1642,7 @@ async function prepareNewAttachmentUpdate(
       summary.refused.push(`${noteFile}: internal error splicing "${ref.match}" - refusing to push`);
       return undefined;
     }
-    const typeUti = utiForImageFilename(ref.relativeFile);
-    if (typeUti === undefined) {
-      summary.refused.push(`${noteFile}: "${ref.relativeFile}" isn't a recognized image type - remove it or push it as-is later`);
-      return undefined;
-    }
+    const typeUti = utiForAttachmentFilename(ref.relativeFile);
     const absoluteFilePath = path.join(targetDir, path.dirname(noteFile), ref.relativeFile);
     let uploaded;
     try {
@@ -1750,7 +1743,7 @@ async function prepareUpdate(
     );
   }
 
-  const parsed = parseNoteMarkdown(localText);
+  const parsed = parseNoteMarkdown(promoteAttachmentLinks(localText));
   if (parsed.status !== "ok") {
     summary.refused.push(`${entry.file}: ${parsed.reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
     return undefined;
@@ -1856,7 +1849,7 @@ async function prepareEmbedCandidate(
   }
   // The placeholder-form markdown (markers and table blocks re-spliced to
   // U+FFFC) is what parses back into the desired text + formatting.
-  const parsed = parseNoteMarkdown(plan.reconstructedBodyText);
+  const parsed = parseNoteMarkdown(promoteAttachmentLinks(plan.reconstructedBodyText));
   if (parsed.status !== "ok") {
     summary.refused.push(`${entry.file}: ${parsed.reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
     return undefined;
