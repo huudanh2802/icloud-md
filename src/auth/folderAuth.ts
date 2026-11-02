@@ -275,7 +275,18 @@ export async function resolveFolderAccount(
   const sessionPath = accountSessionPath(account.dsid, accountsRoot);
   const session = await loadSession(sessionPath);
   const auth = await ensureAuth(session, sessionPath, {
-    recover: (options) => login({ ...options, profileDir: accountProfileDir(account.dsid, accountsRoot), onStatus }),
+    recover: (options) =>
+      login({
+        ...options,
+        profileDir: accountProfileDir(account.dsid, accountsRoot),
+        onStatus,
+        // Lets a headless recovery type the password itself when the profile's
+        // session has lapsed (a desktop wrapper can keep it in the OS keystore
+        // and pass it per run); without it recovery relies on the profile alone.
+        credentials: process.env.ICLOUD_MD_PASSWORD
+          ? { appleId: account.appleId, password: process.env.ICLOUD_MD_PASSWORD }
+          : undefined,
+      }),
   });
 
   if (auth.dsid !== account.dsid) {

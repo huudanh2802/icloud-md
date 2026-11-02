@@ -200,6 +200,14 @@ export interface BrowserLoginOptions {
    */
   headless?: boolean;
   /**
+   * Apple ID + password to type into the sign-in form, for a headless
+   * recovery whose browser profile has lost its session but is still a
+   * trusted device (so Apple asks for the password but no 2FA code). A
+   * profile that does get a 2FA prompt gives up immediately rather than
+   * waiting out the timeout. Never written anywhere by this tool.
+   */
+  credentials?: { appleId: string; password: string } | undefined;
+  /**
    * Give up waiting for sign-in to complete after this many milliseconds.
    * `0` (the default) waits forever, appropriate for the interactive command
    * where a human is at the window. Headless/automated recovery should pass
@@ -247,6 +255,60 @@ function keepMeSignedInWatcher(page: Page, isDone: () => boolean, status: (messa
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     }
   })();
+}
+
+/**
+ * Fills Apple's sign-in form (in the idmsa.apple.com iframe) for a headless
+ * recovery: account name, then - past the optional "Continue with Password"
+ * step newer passkey-first pages show - the password. Polls because each
+ * step renders only after the previous one is submitted. If Apple asks for
+ * a 2FA code the profile isn't trusted any more: closes the page so the
+ * wait fails now instead of at its timeout.
+ */
+async function autoSignIn(
+  page: Page,
+  credentials: { appleId: string; password: string },
+  isDone: () => boolean,
+  status: (message: string) => void,
+): Promise<void> {
+  let accountSent = false;
+  let passwordSent = false;
+  while (!isDone() && !page.isClosed()) {
+    for (const frame of page.frames()) {
+      if (!frame.url().includes("idmsa.apple.com")) {
+        continue;
+      }
+      try {
+        if ((await frame.locator(".form-security-code-input, #char0, [aria-label*='verification code' i]").count()) > 0) {
+          status("Apple asked for a two-factor code - automatic sign-in can't continue; sign in again from the app.");
+          await page.close();
+          return;
+        }
+        const account = frame.locator("#account_name_text_field");
+        if (!accountSent && (await account.count()) > 0 && (await account.isVisible())) {
+          await account.fill(credentials.appleId, { timeout: 2_000 });
+          await account.press("Enter");
+          accountSent = true;
+          continue;
+        }
+        const usePassword = frame.getByRole("button", { name: /continue with password/i });
+        if ((await usePassword.count()) > 0 && (await usePassword.first().isVisible())) {
+          await usePassword.first().click({ timeout: 2_000 });
+          continue;
+        }
+        const password = frame.locator("#password_text_field");
+        if (!passwordSent && (await password.count()) > 0 && (await password.isVisible())) {
+          await password.fill(credentials.password, { timeout: 2_000 });
+          await password.press("Enter");
+          passwordSent = true;
+          status("Signed in again automatically with the saved password.");
+        }
+      } catch {
+        // The frame re-rendered or navigated mid-step; the next poll retries.
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
 }
 
 /** Playwright's own message when a browser's binary hasn't been downloaded yet (matched the same way Playwright's CLI itself detects this failure). */
@@ -371,9 +433,13 @@ export async function performBrowserLogin(options: BrowserLoginOptions = {}): Pr
     // relaunch either auto-validates from the profile's session or fails, no
     // sign-in form is ever completed there.
     let signInDone = false;
-    const watcher = headless
+    const autofill = headless && options.credentials !== undefined;
+    const watcher = headless && !autofill
       ? Promise.resolve()
       : keepMeSignedInWatcher(page, () => signInDone, status).catch(() => undefined);
+    const filler = autofill
+      ? autoSignIn(page, options.credentials!, () => signInDone, status).catch(() => undefined)
+      : Promise.resolve();
 
     let response;
     try {
@@ -394,6 +460,7 @@ export async function performBrowserLogin(options: BrowserLoginOptions = {}): Pr
     await response.finished();
     signInDone = true;
     await watcher;
+    await filler;
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
     const cookies = await context.cookies();
