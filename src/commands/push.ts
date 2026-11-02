@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveFolderAccount } from "../auth/folderAuth.js";
 import { planFolderCreates } from "../notes/folderCreate.js";
@@ -186,6 +186,56 @@ interface PreparedCandidate {
 interface PendingUpload {
   relativeFile: string;
   upload: () => Promise<unknown>;
+}
+
+/**
+ * After a note moved to another folder directory, brings its attachment
+ * files along: from the old folder's `attachments/` into the new one's,
+ * renamed to a free name if the new folder already has a file by that name
+ * (and the note's link rewritten to match), with `state.attachments`
+ * updated so later pulls and pushes find them. An attachment already sitting
+ * in the new folder (moved by hand) just has its tracked path updated.
+ */
+export async function relocateNoteAttachments(
+  targetDir: string,
+  state: CloneState,
+  recordName: string,
+  toFile: string,
+): Promise<void> {
+  const newDir = path.posix.join(path.posix.dirname(toFile.replace(/\\/g, "/")), "attachments");
+  const noteAbs = path.join(targetDir, toFile);
+  for (const attachment of Object.values(state.attachments ?? {})) {
+    if (attachment.noteRecordName !== recordName) {
+      continue;
+    }
+    const oldRel = attachment.file.replace(/\\/g, "/");
+    if (path.posix.dirname(oldRel) === newDir) {
+      continue;
+    }
+    const name = path.posix.basename(oldRel);
+    let newRel = path.posix.join(newDir, name);
+    const oldAbs = path.join(targetDir, oldRel);
+    if (!(await pathExists(oldAbs))) {
+      // Already moved by hand (or gone): only the tracked path changes.
+      attachment.file = newRel;
+      continue;
+    }
+    const ext = path.posix.extname(name);
+    const stem = name.slice(0, name.length - ext.length);
+    for (let i = 2; await pathExists(path.join(targetDir, newRel)); i++) {
+      newRel = path.posix.join(newDir, `${stem} ${i}${ext}`);
+    }
+    await mkdir(path.join(targetDir, newDir), { recursive: true });
+    await rename(oldAbs, path.join(targetDir, newRel));
+    const newName = path.posix.basename(newRel);
+    if (newName !== name) {
+      const text = await readFile(noteAbs, "utf8");
+      const from = `attachments/${encodeURIComponent(name)}`;
+      const to = `attachments/${encodeURIComponent(newName)}`;
+      await writeFile(noteAbs, text.split(`](${from})`).join(`](${to})`), "utf8");
+    }
+    attachment.file = newRel;
+  }
 }
 
 /** Runs an entry's uploads in order; returns a failure message, or
@@ -644,19 +694,10 @@ export async function buildPushPlan(
     // Only a change of *directory* has to relocate anything: attachments
     // live in an `attachments/` directory per folder, named after the
     // attachment rather than the note, so a rename in place leaves every
-    // attachment file exactly where its note's links already point.
-    const hasTrackedAttachments = Object.values(state.attachments ?? {}).some(
-      (attachment) => attachment.noteRecordName === pair.recordName,
-    );
-    if (relocated && hasTrackedAttachments) {
-      entries.push({
-        ...base,
-        reason:
-          "this note has attachments, whose files can't be relocated safely yet - move it back " +
-          "(or move the note in Notes and pull instead)",
-      });
-      continue;
-    }
+    // attachment file exactly where its note's links already point. A
+    // relocated note's attachment files follow it once the move lands (see
+    // relocateNoteAttachments) - remotely an Attachment references its Note,
+    // not a folder, so the server side of the move is the same either way.
     // Under filename-as-title a rename is a retitle, and it has to be sent:
     // the file name is the only local record of the title, so leaving it
     // unsent would let the next pull quietly restore the old name.
@@ -984,6 +1025,9 @@ export async function buildPushPlan(
           recordChangeTag: current.recordChangeTag ?? "",
           modificationDate: modificationDateOf(current) || Date.now(),
         };
+        if (pair.relocated) {
+          await relocateNoteAttachments(targetDir, state, pair.recordName, pair.toFile);
+        }
         await applyNoteFileTimes(path.join(targetDir, pair.toFile), current);
         const what = retitle === undefined ? "Moved" : pair.relocated ? "Moved and retitled" : "Retitled";
         return { succeeded: true, message: `${what} ${pair.entry.file} -> ${pair.toFile}` };

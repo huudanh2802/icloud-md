@@ -459,7 +459,11 @@ test("buildPushPlan pairs a moved-and-edited note by unique basename", () =>
     assert.equal(entries[0]?.previousFile, "Notes/Tracked.md");
   }));
 
-test("buildPushPlan refuses moving a note that has tracked attachments, locally", () =>
+// Moving a note with attachments is no longer refused locally: its files
+// follow it once the move lands (relocateNoteAttachments). state() has no
+// `account`, so the UnboundAccountError proves the plan proceeds toward the
+// network instead of resolving to a local refusal.
+test("buildPushPlan no longer refuses moving a note that has tracked attachments - it proceeds to the network", () =>
   withTempDir(async (dir) => {
     const s = state();
     s.attachments = {
@@ -474,12 +478,7 @@ test("buildPushPlan refuses moving a note that has tracked attachments, locally"
     await writeVaultFile(dir, "Recipes/Tracked.md", "Synced text");
     await writeCloneState(dir, s);
 
-    const { entries } = await buildPushPlan(dir);
-
-    assert.equal(entries.length, 1);
-    assert.equal(entries[0]?.kind, "move");
-    assert.equal(entries[0]?.resolution, "refused");
-    assert.match(entries[0]?.reason ?? "", /has attachments/);
+    await assert.rejects(() => buildPushPlan(dir), UnboundAccountError);
   }));
 
 // Deletion is a trash-move update as of the 2026-07-16 HAR analysis, which
